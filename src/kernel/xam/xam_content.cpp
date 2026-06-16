@@ -15,6 +15,7 @@
 #include <rex/math.h>
 #include <rex/hook.h>
 #include <rex/types.h>
+#include <rex/string.h>
 #include <rex/string/util.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
@@ -22,6 +23,16 @@
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(license_mask, 0, "Kernel", "Set license mask for activated content");
+
+// Recompilation DLC-unlock helper. When non-empty, every marketplace
+// (downloadable) content OPEN is redirected to the local content package whose
+// file_name equals this value, regardless of the content id the game asked for.
+// This lets a recomp satisfy a game's DLC check by shipping one synthetic
+// package (see the project app) without having to reproduce the exact
+// marketplace content id -- which the game may pass as raw binary bytes. Default
+// empty = stock behavior (no redirect).
+REXCVAR_DEFINE_STRING(marketplace_content_redirect, "", "Kernel",
+                      "Redirect all marketplace content opens to this package file_name");
 
 namespace rex {
 namespace kernel {
@@ -133,6 +144,17 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
 
   if (content_data.content_type == XContentType::kMarketplaceContent) {
     xuid = 0;
+
+    // DLC-unlock redirect: point any marketplace open at the configured local
+    // package so the game's DLC check resolves to it, no matter what (possibly
+    // binary / non-UTF-8) content id it supplied. See marketplace_content_redirect.
+    const std::string redirect = REXCVAR_GET(marketplace_content_redirect);
+    if (!redirect.empty() && content_data.file_name() != redirect) {
+      REXKRNL_INFO("XamContentCreate: redirecting marketplace content '{}' -> '{}'",
+                   content_data.file_name(), redirect);
+      content_data.set_file_name(redirect);
+      content_data.set_display_name(rex::string::to_utf16(redirect));
+    }
   }
 
   auto content_manager = REX_KERNEL_STATE()->content_manager();

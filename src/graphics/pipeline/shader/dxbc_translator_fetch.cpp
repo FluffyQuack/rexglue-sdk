@@ -27,6 +27,50 @@
 REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
                     "Scale texture offsets with draw resolution");
 
+// [MSXX] Sample-phase correction (texels) for the in-game upscale. Metal Slug XX
+// builds its playfield by sampling EDRAM-resolved render targets through a
+// multi-pass bilinear upscale (320x240 -> 640x480 -> 860x480 -> 1280x720); a
+// half-texel tap misalignment makes that bilinear degenerate toward nearest,
+// scrambling 1-px HUD glyphs (the "shuffling"). +0.5 was confirmed against a
+// hardware capture to fix it. This biases the source sample coordinate by the
+// given number of texels, but ONLY for fetches of TILED textures (the resolved
+// render targets) -- it reads the tiled bit (fetch-constant word 0, bit 31) in
+// the shader and gates the correction on it, so menu/background/sprite samples
+// of linear (tiled=0) textures are left untouched (a global bias bled non-tiled
+// sprites past their atlas edges -> vertical lines). Default 0 = stock (no shader
+// change at all). Read at shader-translation time; there is no shader disk cache,
+// so a new value applies on the next launch (CLI --game_sample_texel_bias=... or
+// metalslugxx.ini [Graphics] SampleTexelBias).
+REXCVAR_DEFINE_DOUBLE(game_sample_texel_bias, 0.0, "GPU/Shader",
+                      "MSXX: bias (texels) added to TILED (resolved-RT) 2D sample coords");
+
+// [MSXX] Scoped fix for the in-game ~2px up-left offset. Unlike
+// game_sample_texel_bias above (applied to EVERY tiled fetch, whose translation
+// cancels through the multi-pass upscale chain so it never moves the net offset),
+// this biases the sample coord ONLY for the bottom-of-chain LOW-RES render target
+// (the ~320x240 playfield) -- gated on tiled AND source width <=
+// game_lowres_tiled_max_width. Because it is applied at a single, non-cancelling
+// pass, the shift survives to screen: the playfield is point-upscaled ~4x
+// (320 -> 1280), so each texel of bias here lands as ~4 output px (-0.5 texel =
+// ~2px down-right, which aligns the playfield with the Xbox 360 reference).
+// Default -0.5 = the confirmed in-game fix (verified by eye 2026-06-14). Set 0 to
+// disable (stock, no shader change emitted). Read at translate time; no shader
+// disk cache, so a new value applies next launch (CLI --game_lowres_tiled_bias=...
+// or metalslugxx.ini [Graphics] LowresTiledBias). Same bias is added to both axes
+// (the offset is diagonal).
+//
+// KNOWN RESIDUAL / lead for a "proper" fix: the background border around the game
+// screen is still ~1px up-left of ideal because it comes from the 640x480 / 860x480
+// tiled RTs, which the default max_width=480 gate EXCLUDES. Those are upscaled ~2x
+// (640 -> 1280), so a -0.5 bias on them would land as ~1px down-right -- exactly the
+// residual. Raising game_lowres_tiled_max_width to ~860 would also catch them (still
+// below the 1280-wide composite layers, which must NOT be biased). Left at 480 for
+// now: the playfield is the visible win and the border residual is sub-perceptual.
+REXCVAR_DEFINE_DOUBLE(game_lowres_tiled_bias, -0.5, "GPU/Shader",
+                      "MSXX: bias (texels) added to LOW-RES tiled 2D sample coords (2px fix)");
+REXCVAR_DEFINE_UINT32(game_lowres_tiled_max_width, 480, "GPU/Shader",
+                      "MSXX: max source width treated as low-res for game_lowres_tiled_bias");
+
 namespace rex::graphics {
 using namespace ucode;
 
@@ -711,9 +755,32 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // be floored as expected, but the left/upper pixel is still sampled
     // instead.
     const float rounding_offset = 1.5f / 1024.0f;
+    // [MSXX] When the whole-frame "point" override is active, neutralize the
+    // game's edge-directed pixel-art upscaler. That filter (PS hash 393FE019...,
+    // a hq2x/2xSaI/SuperEagle-style algorithm) point-taps the source texture at
+    // +/-1 texel offsets and blends them in ALU according to per-edge colour
+    // comparisons, so it is invisible to both the hardware sampler we force to
+    // point AND the getTextureWeights nearest-rounding. Forcing every real
+    // texture-fetch's in-plane (X/Y) offset to zero makes all of its taps read
+    // the SAME texel as the centre, so every neighbour difference is 0, every
+    // edge test fails, and every blend collapses to the centre texel = pure
+    // nearest-neighbour -- regardless of how the algorithm branches. Single-tap
+    // menu/sprite fetches already use a zero offset, so this is a no-op for them.
+    // Gated on kTextureFetch only (getWeights/getCompTexLOD are handled
+    // elsewhere); offset_z (3D depth / cube face selection) is left untouched so
+    // we never change which slice/face is sampled. Read once per shader-translate
+    // (cvar set before guest code runs); query-by-name as the cvar lives in the
+    // texture-cache TU. See also the getTextureWeights rounding below.
+    const bool msxx_point_zero_xy_offsets =
+        instr.opcode == FetchOpcode::kTextureFetch &&
+        REXCVAR_QUERY(std::string, game_upscale_filter) == "point";
+    const float msxx_offset_x =
+        msxx_point_zero_xy_offsets ? 0.0f : instr.attributes.offset_x;
+    const float msxx_offset_y =
+        msxx_point_zero_xy_offsets ? 0.0f : instr.attributes.offset_y;
     switch (instr.dimension) {
       case xenos::FetchOpDimension::k1D:
-        offsets[0] = instr.attributes.offset_x + rounding_offset;
+        offsets[0] = msxx_offset_x + rounding_offset;
         if (instr.opcode == FetchOpcode::kGetTextureWeights) {
           // For coordinate lerp factors. This needs to be done separately for
           // point mag/min filters, but they're currently not handled here
@@ -722,16 +789,16 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         }
         break;
       case xenos::FetchOpDimension::k2D:
-        offsets[0] = instr.attributes.offset_x + rounding_offset;
-        offsets[1] = instr.attributes.offset_y + rounding_offset;
+        offsets[0] = msxx_offset_x + rounding_offset;
+        offsets[1] = msxx_offset_y + rounding_offset;
         if (instr.opcode == FetchOpcode::kGetTextureWeights) {
           offsets[0] -= 0.5f;
           offsets[1] -= 0.5f;
         }
         break;
       case xenos::FetchOpDimension::k3DOrStacked:
-        offsets[0] = instr.attributes.offset_x + rounding_offset;
-        offsets[1] = instr.attributes.offset_y + rounding_offset;
+        offsets[0] = msxx_offset_x + rounding_offset;
+        offsets[1] = msxx_offset_y + rounding_offset;
         offsets[2] = instr.attributes.offset_z + rounding_offset;
         if (instr.opcode == FetchOpcode::kGetTextureWeights) {
           offsets[0] -= 0.5f;
@@ -742,8 +809,8 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       case xenos::FetchOpDimension::kCube:
         // Applying the rounding epsilon to cube maps too for potential game
         // passes processing cube map faces themselves.
-        offsets[0] = instr.attributes.offset_x + rounding_offset;
-        offsets[1] = instr.attributes.offset_y + rounding_offset;
+        offsets[0] = msxx_offset_x + rounding_offset;
+        offsets[1] = msxx_offset_y + rounding_offset;
         if (instr.opcode == FetchOpcode::kGetTextureWeights) {
           offsets[0] -= 0.5f;
           offsets[1] -= 0.5f;
@@ -827,6 +894,15 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         // The size is not needed for face ID offset.
         size_needed_components &= 0b0011;
         break;
+    }
+    // [MSXX] The tiled-gated sample-phase correction (emitted after the
+    // coordinate is assembled) needs the width/height in floats to convert the
+    // texel bias into normalized space - force them to be loaded.
+    if (instr.opcode == FetchOpcode::kTextureFetch &&
+        instr.dimension == xenos::FetchOpDimension::k2D &&
+        (REXCVAR_GET(game_sample_texel_bias) != 0.0 ||
+         REXCVAR_GET(game_lowres_tiled_bias) != 0.0)) {
+      size_needed_components |= 0b0011;
     }
   }
   if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked && size_needed_components) {
@@ -968,6 +1044,20 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     }
     // 0.5 has already been subtracted via offsets previously.
     a_.OpFrc(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components), coord_src);
+    // [MSXX] getTextureWeights returns the bilinear lerp factors (frac of the
+    // texel-space coordinate); the game's shader then lerps the texels itself, so
+    // this manual filter never passes through the hardware sampler that
+    // texture_cache.cpp forces to point. Metal Slug XX's in-game upscale is one of
+    // these shaders, which is why forcing point on the sampler left the playfield
+    // smoothed. When the whole-frame "point" override is active, round the lerp
+    // factors to the nearest texel (0 or 1) so the manual bilinear degenerates to
+    // manual nearest. Read once per shader translate (cvar is set before guest
+    // code runs), so no per-pixel cost; query-by-name because the cvar lives in
+    // the GPU TU. Filtering modes are otherwise ignored here (see FIXMEs above).
+    if (REXCVAR_QUERY(std::string, game_upscale_filter) == "point") {
+      a_.OpRoundNE(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+                   dxbc::Src::R(system_temp_result_));
+    }
     if (coord_operand_temp_pushed) {
       PopSystemTemp();
     }
@@ -1237,6 +1327,73 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     }
     if (coord_operand_temp_pushed) {
       PopSystemTemp();
+    }
+
+    // [MSXX] Tiled-gated half-texel sample-phase correction. The in-game upscale
+    // samples tiled (EDRAM-resolved) render targets; a half-texel tap
+    // misalignment makes its bilinear degenerate toward nearest (scrambled HUD).
+    // Bias the (now normalized) sample coordinate by game_sample_texel_bias
+    // texels, but only when the bound texture is tiled (fetch-constant word 0
+    // bit 31) - leaving linear-layout menu/sprite samples untouched. coord and
+    // size_and_is_3d_temp (forced loaded above) are both live here.
+    if (instr.opcode == FetchOpcode::kTextureFetch &&
+        instr.dimension == xenos::FetchOpDimension::k2D) {
+      float sample_bias = float(REXCVAR_GET(game_sample_texel_bias));
+      if (sample_bias != 0.0f) {
+        uint32_t bias_temp = PushSystemTemp();
+        // bias_temp.w = tiled bit (word 0, bit 31) as float 0.0 / 1.0.
+        a_.OpUBFE(dxbc::Dest::R(bias_temp, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(31),
+                  RequestTextureFetchConstantWord(tfetch_index, 0));
+        a_.OpUToF(dxbc::Dest::R(bias_temp, 0b1000), dxbc::Src::R(bias_temp, dxbc::Src::kWWWW));
+        // bias_temp.xy = (bias / size.xy) * tiled  (normalized half-texel shift).
+        a_.OpDiv(dxbc::Dest::R(bias_temp, 0b0011),
+                 dxbc::Src::LF(sample_bias, sample_bias, 0.0f, 0.0f),
+                 dxbc::Src::R(size_and_is_3d_temp));
+        a_.OpMul(dxbc::Dest::R(bias_temp, 0b0011), dxbc::Src::R(bias_temp),
+                 dxbc::Src::R(bias_temp, dxbc::Src::kWWWW));
+        a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+                 dxbc::Src::R(coord_and_sampler_temp), dxbc::Src::R(bias_temp));
+        PopSystemTemp();
+      }
+    }
+
+    // [MSXX] EMPIRICAL low-res-source-gated sample-phase shift (the 2px offset
+    // fix). Applies game_lowres_tiled_bias texels to the sample coord ONLY when
+    // the bound texture is tiled AND its source width <= game_lowres_tiled_max_width
+    // (i.e. the bottom-of-chain ~320x240 playfield RT, not the intermediate 640/
+    // 860/1280-wide passes). Applied at one non-cancelling pass, so the shift
+    // survives the upscale (0.5 texel * ~4x = ~2px). coord and size_and_is_3d_temp
+    // are both live here.
+    if (instr.opcode == FetchOpcode::kTextureFetch &&
+        instr.dimension == xenos::FetchOpDimension::k2D) {
+      float lowres_bias = float(REXCVAR_GET(game_lowres_tiled_bias));
+      if (lowres_bias != 0.0f) {
+        // Half-open upper bound so width == max_width still counts as low-res.
+        float max_width = float(REXCVAR_GET(game_lowres_tiled_max_width)) + 0.5f;
+        uint32_t bias_temp = PushSystemTemp();
+        // bias_temp.w = tiled bit (word 0, bit 31) as float 0.0 / 1.0.
+        a_.OpUBFE(dxbc::Dest::R(bias_temp, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(31),
+                  RequestTextureFetchConstantWord(tfetch_index, 0));
+        a_.OpUToF(dxbc::Dest::R(bias_temp, 0b1000), dxbc::Src::R(bias_temp, dxbc::Src::kWWWW));
+        // bias_temp.z = (size.x < max_width) ? 1.0 : 0.0  (low-res gate). OpLT
+        // yields 0xFFFFFFFF / 0; AND with the bit pattern of 1.0f -> 1.0 / 0.0.
+        a_.OpLT(dxbc::Dest::R(bias_temp, 0b0100),
+                dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kXXXX), dxbc::Src::LF(max_width));
+        a_.OpAnd(dxbc::Dest::R(bias_temp, 0b0100), dxbc::Src::R(bias_temp, dxbc::Src::kZZZZ),
+                 dxbc::Src::LU(0x3F800000u));
+        // bias_temp.w = tiled * low-res (combined gate, float 0.0 / 1.0).
+        a_.OpMul(dxbc::Dest::R(bias_temp, 0b1000), dxbc::Src::R(bias_temp, dxbc::Src::kWWWW),
+                 dxbc::Src::R(bias_temp, dxbc::Src::kZZZZ));
+        // bias_temp.xy = (bias / size.xy) * gate  (normalized shift, both axes).
+        a_.OpDiv(dxbc::Dest::R(bias_temp, 0b0011),
+                 dxbc::Src::LF(lowres_bias, lowres_bias, 0.0f, 0.0f),
+                 dxbc::Src::R(size_and_is_3d_temp));
+        a_.OpMul(dxbc::Dest::R(bias_temp, 0b0011), dxbc::Src::R(bias_temp),
+                 dxbc::Src::R(bias_temp, dxbc::Src::kWWWW));
+        a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+                 dxbc::Src::R(coord_and_sampler_temp), dxbc::Src::R(bias_temp));
+        PopSystemTemp();
+      }
     }
 
     if (instr.opcode == FetchOpcode::kGetTextureComputedLod) {

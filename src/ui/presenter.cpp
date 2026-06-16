@@ -89,6 +89,16 @@ REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                     "Allow overscan cutoff based on safe area settings")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// When the guest output is scaled to the host window in the final present pass,
+// use nearest-neighbour instead of bilinear. The default bilinear blit smooths
+// everything as it stretches the guest's front buffer to the window; for a
+// low-res pixel-art title presenting a small guest output (e.g. 1280x720) onto a
+// larger window, that final stretch is what re-blurs an otherwise crisp frame.
+// Read once when the present sampler is built (hence restart lifecycle).
+REXCVAR_DEFINE_BOOL(present_point_filter, false, "UI/Presenter",
+                    "Use nearest-neighbour instead of bilinear for the final guest-output scale")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace {
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
 

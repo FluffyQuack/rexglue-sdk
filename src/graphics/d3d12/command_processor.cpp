@@ -2009,6 +2009,37 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
+  // [MSXX] Diagnostic: log the per-swap guest-output geometry so we can localize
+  // the in-game upscale blur. If the in-game front buffer is small (e.g.
+  // 320x240/512x...) while menus present at ~native, the host presenter is doing
+  // the stretch (fix lives in the presenter); if both present at ~native, the
+  // guest already upscaled internally (fix lives in the GPU sampler/half-pixel
+  // path). Logs once and again only when the geometry changes (e.g. menu <->
+  // in-game) to stay quiet. Strip once the sprite-filtering bug is resolved.
+  {
+    static uint32_t last_fb_w = 0, last_fb_h = 0, last_src_w = 0, last_src_h = 0, last_out_w = 0,
+                    last_out_h = 0, last_disp_w = 0, last_disp_h = 0;
+    if (frontbuffer_width != last_fb_w || frontbuffer_height != last_fb_h ||
+        source_width_scaled != last_src_w || source_height_scaled != last_src_h ||
+        guest_output_width != last_out_w || guest_output_height != last_out_h ||
+        display_width != last_disp_w || display_height != last_disp_h) {
+      last_fb_w = frontbuffer_width;
+      last_fb_h = frontbuffer_height;
+      last_src_w = source_width_scaled;
+      last_src_h = source_height_scaled;
+      last_out_w = guest_output_width;
+      last_out_h = guest_output_height;
+      last_disp_w = display_width;
+      last_disp_h = display_height;
+      REXGPU_INFO(
+          "[MSXX] swap geometry: packet={}x{} source_tex={}x{} unscaled_src={}x{} "
+          "guest_output={}x{} display={}x{} fmt={}",
+          frontbuffer_width, frontbuffer_height, source_width_scaled, source_height_scaled,
+          frontbuffer_width_unscaled, frontbuffer_height_unscaled, guest_output_width,
+          guest_output_height, display_width, display_height, uint32_t(frontbuffer_format));
+    }
+  }
+
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,

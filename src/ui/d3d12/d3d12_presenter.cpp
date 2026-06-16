@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <memory>
@@ -603,6 +604,21 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   }
 
   if (guest_output_resource) {
+    // [MSXX] One-shot: log the final present scale (guest front buffer -> host
+    // swap chain). If the swap chain is larger, the guest output is stretched in
+    // this pass; with bilinear that re-smooths a crisp guest frame (see
+    // present_point_filter). Lets us confirm whether the in-game blur is the host
+    // present stretch rather than guest-internal sampling.
+    {
+      static std::atomic<bool> logged{false};
+      bool expected = false;
+      if (logged.compare_exchange_strong(expected, true)) {
+        REXLOG_INFO("[MSXX] present scale: guest_output={}x{} -> swap_chain={}x{} (point_filter={})",
+                    guest_output_properties.frontbuffer_width,
+                    guest_output_properties.frontbuffer_height, paint_context_.swap_chain_width,
+                    paint_context_.swap_chain_height, REXCVAR_QUERY(bool, present_point_filter));
+      }
+    }
     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
         D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
@@ -1233,9 +1249,15 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
   guest_output_paint_root_parameter_effect_constants.Constants.RegisterSpace = 0;
   guest_output_paint_root_parameter_effect_constants.ShaderVisibility =
       D3D12_SHADER_VISIBILITY_PIXEL;
-  // Bilinear sampler.
+  // Guest-output scaling sampler -- bilinear by default, or nearest-neighbour
+  // when present_point_filter is set (crisp pixel art; see the cvar in
+  // presenter.cpp). The "bilinear" paint shader does a single Sample() through
+  // this sampler, so swapping the filter is all that's needed to make the final
+  // stretch nearest -- no separate shader/pipeline.
+  const bool present_point_filter = REXCVAR_QUERY(bool, present_point_filter);
   D3D12_STATIC_SAMPLER_DESC guest_output_paint_root_sampler;
-  guest_output_paint_root_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+  guest_output_paint_root_sampler.Filter =
+      present_point_filter ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
   guest_output_paint_root_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
   guest_output_paint_root_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
   guest_output_paint_root_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;

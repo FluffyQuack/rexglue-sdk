@@ -45,16 +45,13 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   uint32_t result = X_E_NO_SUCH_USER;
   uint64_t xuid = 0;
   if (user_index < 4) {
-    if (user_index == 0) {
+    if (xeXamUserIsLocallySignedIn(user_index)) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       auto type = user_profile->type() & type_mask;
-      if (type & (2 | 4)) {
-        // maybe online profile?
-        xuid = user_profile->xuid();
-        result = X_E_SUCCESS;
-      } else if (type & 1) {
-        // maybe offline profile?
-        xuid = user_profile->xuid();
+      if (type & (1 | 2 | 4)) {
+        // Co-op slots share the single loaded profile but get a distinct XUID
+        // so the game treats them as separate users.
+        xuid = user_profile->xuid() + user_index;
         result = X_E_SUCCESS;
       }
     }
@@ -67,11 +64,9 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
 
 u32 XamUserGetSigninState_entry(u32 user_index) {
   uint32_t signin_state = 0;
-  if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
-    }
+  if (user_index < 4 && xeXamUserIsLocallySignedIn(user_index)) {
+    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    signin_state = user_profile->signin_state();
   }
   return signin_state;
 }
@@ -92,12 +87,12 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
-  if (user_index) {
+  if (user_index >= 4 || !xeXamUserIsLocallySignedIn(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  info->xuid = user_profile->xuid();
+  info->xuid = user_profile->xuid() + user_index;
   info->signin_state = user_profile->signin_state();
   rex::string::util_copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
   return X_E_SUCCESS;
@@ -108,7 +103,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  if (!xeXamUserIsLocallySignedIn(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
@@ -123,7 +118,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  if (!xeXamUserIsLocallySignedIn(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
@@ -211,8 +206,9 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   // Title ID = 0 means us.
   // 0xfffe07d1 = profile?
 
-  if (!xuids && user_index) {
-    // Only support user 0.
+  if (!xuids && user_index && !xeXamUserIsLocallySignedIn(user_index)) {
+    // Unknown user. Co-op slots (1..3 with a connected pad) fall through and
+    // read the shared profile so a joined P2 sees the same settings as P1.
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(
           REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
@@ -308,8 +304,8 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (user_index) {
-    // Only support user 0.
+  if (!xeXamUserIsLocallySignedIn(user_index)) {
+    // Unknown user. Co-op slots write into the shared profile.
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
                                                       X_ERROR_NO_SUCH_USER);
@@ -377,7 +373,7 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
       return X_ERROR_INVALID_PARAMETER;
     }
 
-    if (user_index) {
+    if (!xeXamUserIsLocallySignedIn(user_index)) {
       return X_ERROR_NO_SUCH_USER;
     }
   }
@@ -388,7 +384,7 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
 }
 
 u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags) {
-  if (user_index) {
+  if (!xeXamUserIsLocallySignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
 
@@ -399,7 +395,7 @@ u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags
 
 u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u32 out_unk2,
                                              mapped_u32 out_unk3) {
-  if (user_index) {
+  if (!xeXamUserIsLocallySignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
 
@@ -430,7 +426,7 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
   if (user_index >= 4) {
     return X_ERROR_INVALID_PARAMETER;
   }
-  if (user_index) {
+  if (!xeXamUserIsLocallySignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
   return 6 /* 6 appears to be Gold */;
@@ -444,7 +440,7 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
   if (user_index >= 4) {
     result = X_ERROR_INVALID_PARAMETER;
   } else {
-    if (user_index == 0) {
+    if (xeXamUserIsLocallySignedIn(user_index)) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       if (user_profile->signin_state() == 0) {
         result = X_ERROR_NOT_LOGGED_ON;
@@ -454,7 +450,6 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
         result = X_ERROR_SUCCESS;
       }
     } else {
-      // Only support user 0.
       result = X_ERROR_NO_SUCH_USER;  // if user is local -> X_ERROR_NOT_LOGGED_ON
     }
   }
@@ -648,6 +643,57 @@ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 x
   return X_ERROR_SUCCESS;
 }
 
+// XUSER_STATS_SPEC: caller-supplied description of which leaderboard view +
+// columns to enumerate. Only num_column_ids is needed here (to size the result
+// buffer); column_ids has a fixed max of XUSER_STATS_COLUMNS_MAX (64).
+struct X_USER_STATS_SPEC {
+  rex::be<uint32_t> view_id;
+  rex::be<uint32_t> num_column_ids;
+  rex::be<uint16_t> column_ids[0x40];
+};
+static_assert_size(X_USER_STATS_SPEC, 0x88);
+
+u32 XamUserCreateStatsEnumerator_entry(u32 title_id, u32 user_index, u32 count, u32 flags,
+                                       u32 specs_count, ppc_ptr_t<X_USER_STATS_SPEC> specs_ptr,
+                                       mapped_u32 buffer_size_ptr, mapped_u32 handle_ptr) {
+  if (!count || !specs_count || !specs_ptr || !handle_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (user_index >= 4) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  // Size the result buffer the way the title expects: one stats-row header per
+  // requested row, plus one column slot per requested stat column. We have no
+  // leaderboard/stats data offline, so the enumerator yields zero rows -- but
+  // the title still allocates this buffer up front, so it must be sane (a
+  // missing/garbage value here is what made the bare stub trigger a giant
+  // BaseHeap alloc and a thrown bad_alloc).
+  uint32_t num_columns = 0;
+  for (uint32_t i = 0; i < specs_count; i++) {
+    num_columns += static_cast<uint32_t>(specs_ptr[i].num_column_ids);
+  }
+
+  constexpr uint32_t kRowHeaderSize = 0x30;  // XUID, rank, rating, gamertag, count, columns ptr
+  constexpr uint32_t kColumnSize = 0x20;     // column id + XUSER_DATA value
+  const uint32_t row_size = kRowHeaderSize + num_columns * kColumnSize;
+
+  if (buffer_size_ptr) {
+    *buffer_size_ptr = row_size * count;
+  }
+
+  auto e = object_ref<XStaticUntypedEnumerator>(
+      new XStaticUntypedEnumerator(REX_KERNEL_STATE(), count, row_size));
+  auto result = e->Initialize(user_index, 0xFB, 0xB0008, 0xB0009, 0);
+  if (XFAILED(result)) {
+    return result;
+  }
+
+  // No items appended -> XamEnumerate returns an empty result set.
+  *handle_ptr = e->handle();
+  return X_ERROR_SUCCESS;
+}
+
 u32 XamParseGamerTileKey_entry(mapped_u32 key_ptr, mapped_u32 out1_ptr, mapped_u32 out2_ptr,
                                mapped_u32 out3_ptr) {
   *out1_ptr = 0xC0DE0001;
@@ -730,7 +776,8 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
 REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
 REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
-REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
+REX_EXPORT(__imp__XamUserCreateStatsEnumerator,
+           rex::kernel::xam::XamUserCreateStatsEnumerator_entry)
 REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 REX_EXPORT_STUB(__imp__XamUserGetAge);

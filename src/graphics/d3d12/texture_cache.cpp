@@ -13,11 +13,15 @@
 #include <array>
 #include <cfloat>
 #include <cstddef>
+#include <cstdio>  // [MSXX] diagnostic, strip later
 #include <cstring>
 #include <memory>
+#include <unordered_set>
 #include <utility>
+#include <vector>  // [MSXX] diagnostic, strip later
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
@@ -25,8 +29,10 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
+#include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
+#include <rex/system/kernel_state.h>  // [MSXX] diagnostic, strip later
 #include <rex/perf/counter.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
@@ -925,6 +931,81 @@ uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
   return descriptor_index;
 }
 
+// [MSXX] Override the filter used for *every* texture the game samples, so the
+// whole pixel-art chain can be forced crisp (or smooth) in one switch. Metal Slug
+// XX draws its sprite/background atlases (tiled=0) onto a native ~320x240 frame,
+// then resolves that to a tiled render target and upscales it (tiled=1) up to
+// 1280x720. Both stages are plain texture samples, so the override has to cover
+// both -- restricting it to the tiled upscale leaves the sprite draws smoothed.
+//   "default" - keep the guest's chosen filter (stock behavior).
+//   "linear"  - force bilinear everywhere (smoothest).
+//   "point"   - force nearest everywhere, anisotropy off (crisp pixel-art look).
+// Affects menus too (they are pixel art as well). Driven from metalslugxx.ini
+// [Graphics] GameUpscaleFilter.
+REXCVAR_DEFINE_STRING(game_upscale_filter, "default", "GPU",
+                      "Whole-frame texture filter override: default, linear, point");
+
+// [MSXX] diagnostic, strip later. Untile a 2D tiled k_8_8_8_8 (resolved-RT)
+// texture straight from guest memory and write it as an uncompressed 24-bit BMP
+// in the working directory, so we can see whether the resolved content is
+// correctly framed inside the RT (=> the ~2px in-game offset is introduced at the
+// final upscale blit) or already shifted (=> introduced at the scene render).
+// CPU untile via GetTiledOffset2D — no GPU readback / fence sync needed.
+static void MsxxDumpTiledTextureBmp(const uint8_t* base, uint32_t width, uint32_t height,
+                                    uint32_t pitch_pixels, xenos::Endian endianness,
+                                    const char* name) {
+  if (!base || width == 0 || height == 0) {
+    return;
+  }
+  const uint32_t row = width * 3u;
+  const uint32_t img_size = row * height;
+  std::vector<uint8_t> px(img_size, 0u);
+  for (uint32_t y = 0; y < height; ++y) {
+    uint8_t* dst = px.data() + size_t(height - 1u - y) * row;  // BMP is bottom-up
+    for (uint32_t x = 0; x < width; ++x) {
+      int32_t off = texture_util::GetTiledOffset2D(int32_t(x), int32_t(y), pitch_pixels, 2);
+      uint32_t texel = xenos::GpuSwap(*reinterpret_cast<const uint32_t*>(base + off), endianness);
+      // Channel order is a guess (k_8_8_8_8); colours may be swapped but the
+      // framing/position — all we care about — is unaffected.
+      dst[x * 3 + 0] = uint8_t((texel >> 16) & 0xFF);  // B
+      dst[x * 3 + 1] = uint8_t((texel >> 8) & 0xFF);   // G
+      dst[x * 3 + 2] = uint8_t(texel & 0xFF);          // R
+    }
+  }
+  const uint32_t file_size = 54u + img_size;
+  uint8_t hdr[54] = {};
+  hdr[0] = 'B';
+  hdr[1] = 'M';
+  hdr[2] = uint8_t(file_size);
+  hdr[3] = uint8_t(file_size >> 8);
+  hdr[4] = uint8_t(file_size >> 16);
+  hdr[5] = uint8_t(file_size >> 24);
+  hdr[10] = 54;  // pixel data offset
+  hdr[14] = 40;  // info header size
+  hdr[18] = uint8_t(width);
+  hdr[19] = uint8_t(width >> 8);
+  hdr[20] = uint8_t(width >> 16);
+  hdr[21] = uint8_t(width >> 24);
+  hdr[22] = uint8_t(height);
+  hdr[23] = uint8_t(height >> 8);
+  hdr[24] = uint8_t(height >> 16);
+  hdr[25] = uint8_t(height >> 24);
+  hdr[26] = 1;   // planes
+  hdr[28] = 24;  // bpp
+  hdr[34] = uint8_t(img_size);
+  hdr[35] = uint8_t(img_size >> 8);
+  hdr[36] = uint8_t(img_size >> 16);
+  hdr[37] = uint8_t(img_size >> 24);
+  std::FILE* f = std::fopen(name, "wb");
+  if (!f) {
+    return;
+  }
+  std::fwrite(hdr, 1, sizeof(hdr), f);
+  std::fwrite(px.data(), 1, img_size, f);
+  std::fclose(f);
+  REXGPU_INFO("[MSXX] dumped tiled texture {}x{} -> {}", width, height, name);
+}
+
 D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
     const D3D12Shader::SamplerBinding& binding) const {
   const auto& regs = register_file();
@@ -987,6 +1068,144 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
     parameters.mip_linear = mip_filter == xenos::TextureFilter::kLinear;
   }
   parameters.mip_base_map = mip_base_map;
+
+  // [MSXX] Apply the whole-frame filter override (see cvar above). Metal Slug XX
+  // builds its image in several sampling stages: it first draws its pixel-art
+  // sprite/background atlases (linear-layout, tiled=0, usually with anisotropy)
+  // onto a native ~320x240 playfield, then resolves that frame to a tiled render
+  // target and upscales it through 640x480 -> 860x480 -> 1280x720 (tiled=1).
+  // Forcing the filter on *every* sampled texture is what makes the entire chain
+  // nearest-neighbour; gating to tiled-only (as we did at first) left the
+  // sprite-draw stage smoothed, so only the final upscale ever looked crisp.
+  {
+    const std::string& filter_override = REXCVAR_GET(game_upscale_filter);
+    if (filter_override == "linear") {
+      parameters.mag_linear = 1;
+      parameters.min_linear = 1;
+    } else if (filter_override == "point") {
+      parameters.mag_linear = 0;
+      parameters.min_linear = 0;
+      parameters.mip_linear = 0;
+      // Anisotropic filtering selects D3D12_FILTER_ANISOTROPIC below regardless of
+      // the min/mag flags, which is a smooth filter -- so it must be disabled too,
+      // or the pixel-art sprites (sampled at aniso=3) stay smoothed.
+      parameters.aniso_filter = xenos::AnisoFilter::kDisabled;
+    }
+  }
+
+  // [MSXX] Diagnostic: log each unique sampled texture (base, size, format) with
+  // the filters actually applied, once per distinct combination. Goal: identify
+  // the in-game upscale source (the small ~320x240 render target that fills the
+  // ~865x649 center region) and confirm whether it's sampled point / linear /
+  // mismatched — the "broken bilinear" bug. Strip once the issue is resolved.
+  if (REXCVAR_QUERY(bool, msxx_diag)) {
+    static std::unordered_set<uint64_t> seen;
+    uint32_t width = fetch.size_2d.width + 1;
+    uint32_t height = fetch.size_2d.height + 1;
+    // Destination extent of the current draw (viewport scale -> pixels). Tells us
+    // what each texture is being scaled *to*, so the on-screen upscale draw
+    // (small source -> large dest) is unambiguous.
+    float vport_xscale = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE);
+    float vport_yscale = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE);
+    uint32_t dest_w = uint32_t((vport_xscale < 0 ? -vport_xscale : vport_xscale) * 2.0f + 0.5f);
+    uint32_t dest_h = uint32_t((vport_yscale < 0 ? -vport_yscale : vport_yscale) * 2.0f + 0.5f);
+    uint64_t key = (uint64_t(fetch.base_address) << 32) ^ (uint64_t(width) << 19) ^
+                   (uint64_t(height) << 6) ^ (uint64_t(fetch.format) << 4) ^
+                   (uint64_t(parameters.mag_linear) << 1) ^ uint64_t(parameters.min_linear) ^
+                   (uint64_t(dest_w) << 40) ^ (uint64_t(dest_h) << 24);
+    if (seen.insert(key).second) {
+      if (seen.size() > 4096) {
+        seen.clear();  // bound memory; re-log if the working set churns
+      }
+      // Raw guest intent, before resolution, to tell a genuine guest choice from
+      // a translation downgrade: fetch = the fetch-constant filter, bind = the
+      // shader sampler-binding filter (kUseFetchConst means "defer to fetch").
+      auto fc = [](xenos::TextureFilter f) -> char {
+        switch (f) {
+          case xenos::TextureFilter::kPoint:
+            return 'p';
+          case xenos::TextureFilter::kLinear:
+            return 'l';
+          case xenos::TextureFilter::kBaseMap:
+            return 'b';
+          default:
+            return 'F';  // kUseFetchConst
+        }
+      };
+      REXGPU_INFO(
+          "[MSXX] sampled tex@{:08X} {}x{} -> dest {}x{} fmt={} tiled={} mag={} min={} mip={} "
+          "aniso={} | fetchf={}{} bindf={}{}",
+          uint32_t(fetch.base_address) << 12, width, height, dest_w, dest_h, uint32_t(fetch.format),
+          uint32_t(fetch.tiled), parameters.mag_linear ? "linear" : "point",
+          parameters.min_linear ? "linear" : "point",
+          parameters.mip_base_map ? "basemap" : (parameters.mip_linear ? "linear" : "point"),
+          uint32_t(parameters.aniso_filter), fc(fetch.mag_filter), fc(fetch.min_filter),
+          fc(binding.mag_filter), fc(binding.min_filter));
+    }
+  }
+
+  // [MSXX] Diagnostic: dump the resolved (tiled) source texture to a BMP so we can
+  // see whether the in-game content is already shifted inside the RT. Each distinct
+  // tiled k_8_8_8_8 source is dumped once (bounded). Strip later.
+  if (REXCVAR_QUERY(bool, msxx_diag) && fetch.tiled &&
+      uint32_t(fetch.format) == 6u) {  // 6 = k_8_8_8_8
+    static std::unordered_set<uint64_t> dumped;
+    const uint32_t w = fetch.size_2d.width + 1;
+    const uint32_t h = fetch.size_2d.height + 1;
+    const uint64_t key =
+        (uint64_t(fetch.base_address) << 26) ^ (uint64_t(w) << 13) ^ uint64_t(h);
+    if (dumped.size() < 16 && dumped.insert(key).second) {
+      const uint8_t* texbase = rex::system::kernel_memory()->TranslatePhysical<uint8_t*>(
+          uint32_t(fetch.base_address) << 12);
+      char name[128];
+      std::snprintf(name, sizeof(name), "msxx_resolved_%08X_%ux%u.bmp",
+                    uint32_t(fetch.base_address) << 12, w, h);
+      MsxxDumpTiledTextureBmp(texbase, w, h, uint32_t(fetch.pitch) << 5, fetch.endianness, name);
+    }
+  }
+
+  // [MSXX] Diagnostic: geometry placement of the in-game upscale draw. With the
+  // texcoord bias OFF, the in-game window + border still sit ~2px up-left of the
+  // Xbox 360 reference (the menu is correct), which points at a half-pixel /
+  // pixel-center placement issue on this draw, not a sampling one. The SDK adds
+  // +0.5 px to the geometry (draw.cpp GetHostViewportInfo: ndc_offset) only when
+  // PA_SU_VTX_CNTL.pix_center == kD3DZero AND the half_pixel_offset cvar is on;
+  // log the deciding inputs for the tiled (resolved-RT) upscale source so we can
+  // see why that +0.5 isn't landing here. Fires once per distinct placement; it
+  // lands on the same call as the "sampled tex ... -> dest 865x649" line above,
+  // so the upscale draw's row is unambiguous. Strip once the offset is fixed.
+  if (REXCVAR_QUERY(bool, msxx_diag) && fetch.tiled) {
+    auto pa_su_vtx_cntl = regs.Get<reg::PA_SU_VTX_CNTL>();
+    auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
+    auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+    const bool pix_center_d3d9 = pa_su_vtx_cntl.pix_center == xenos::PixelCenter::kD3DZero;
+    const bool half_px_applied = REXCVAR_QUERY(bool, half_pixel_offset) && pix_center_d3d9;
+    const float vport_xoffset =
+        pa_cl_vte_cntl.vport_x_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET) : 0.0f;
+    const float vport_yoffset =
+        pa_cl_vte_cntl.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f;
+    const float vport_xscale =
+        pa_cl_vte_cntl.vport_x_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f;
+    const float vport_yscale =
+        pa_cl_vte_cntl.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f;
+    static std::unordered_set<uint64_t> seen_placement;
+    const uint64_t pkey = (uint64_t(pix_center_d3d9) << 0) ^
+                          (uint64_t(pa_cl_clip_cntl.clip_disable) << 1) ^
+                          (uint64_t(uint32_t(int32_t(vport_xoffset))) << 8) ^
+                          (uint64_t(uint32_t(int32_t(vport_yoffset))) << 28) ^
+                          (uint64_t(uint32_t(int32_t(vport_xscale))) << 48);
+    if (seen_placement.insert(pkey).second) {
+      if (seen_placement.size() > 1024) {
+        seen_placement.clear();
+      }
+      REXGPU_INFO(
+          "[MSXX] upscale placement: pix_center={} (d3d9={}) half_px_offset_applied={} "
+          "clip_disable={} resscale={}x{} vport_off=({:.3f},{:.3f}) vport_scale=({:.3f},{:.3f})",
+          uint32_t(pa_su_vtx_cntl.pix_center), pix_center_d3d9 ? 1 : 0, half_px_applied ? 1 : 0,
+          uint32_t(pa_cl_clip_cntl.clip_disable), draw_resolution_scale_x(),
+          draw_resolution_scale_y(), vport_xoffset, vport_yoffset, vport_xscale, vport_yscale);
+    }
+  }
 
   return parameters;
 }

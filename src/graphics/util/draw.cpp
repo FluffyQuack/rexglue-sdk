@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_set>  // [MSXX] diagnostic, strip later
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -27,6 +28,14 @@
 #include <rex/ui/graphics_util.h>
 
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "GPU", "Enable half pixel offset");
+
+// [MSXX] Master gate for the [MSXX] 2px-offset diagnostics (verbose per-draw/
+// resolve/sample logging + the tiled-texture BMP dumps in texture_cache.cpp).
+// Default OFF so normal runs are quiet; re-enable with --msxx_diag=true when
+// returning to the offset investigation. Queried (by name) from texture_cache.cpp
+// too. Strip the diagnostics entirely once the offset work is finalized.
+REXCVAR_DEFINE_BOOL(msxx_diag, false, "GPU",
+                    "MSXX: enable [MSXX] offset-investigation diagnostics (logs + texture dumps)");
 
 REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU",
                     "Fill half pixel offset during resolution scale resolve");
@@ -343,10 +352,12 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
     // offsetting in the vertex shader.
 
     // XY.
+    uint32_t dbg_extent_unscaled[2] = {0, 0};  // [MSXX] diagnostic, strip later
     for (uint32_t i = 0; i < 2; ++i) {
       viewport_info_out.xy_offset[i] = 0;
       uint32_t extent_axis_unscaled =
           std::min(xenos::kTexture2DCubeMaxWidthHeight, xy_max_unscaled[i]);
+      dbg_extent_unscaled[i] = extent_axis_unscaled;  // [MSXX] diagnostic, strip later
       viewport_info_out.xy_extent[i] =
           extent_axis_unscaled * (i ? draw_resolution_scale_y : draw_resolution_scale_x);
       float extent_axis_unscaled_float = float(extent_axis_unscaled);
@@ -354,6 +365,37 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
       ndc_scale[i] = scale_xy[i] * pixels_to_ndc_axis;
       ndc_offset[i] = (offset_base_xy[i] - extent_axis_unscaled_float * 0.5f + offset_add_xy[i]) *
                       pixels_to_ndc_axis;
+    }
+
+    // [MSXX] Diagnostic: the clip-disabled pass-through path is where the in-game
+    // upscale blits land. ndc_offset here carries the half-pixel (offset_add_xy
+    // += 0.5) shift; the visible pixel error is that NDC offset times the host
+    // extent / 2. Log extent + the deciding inputs once per distinct placement so
+    // we can see (a) what coordinate space these blits use (is the +0.5 px really
+    // 0.5 output px, or 2 px in a 4x-smaller space?) and (b) whether the correct
+    // menu and the offset in-game share the exact same placement. Strip later.
+    if (REXCVAR_GET(msxx_diag)) {
+      const bool half_px =
+          REXCVAR_GET(half_pixel_offset) && pa_su_vtx_cntl.pix_center == xenos::PixelCenter::kD3DZero;
+      static std::unordered_set<uint64_t> seen_vp;
+      const uint64_t k = (uint64_t(dbg_extent_unscaled[0]) << 0) ^
+                         (uint64_t(dbg_extent_unscaled[1]) << 16) ^
+                         (uint64_t(uint32_t(int32_t(ndc_offset[0] * 100000.0f))) << 32) ^
+                         (uint64_t(half_px) << 63);
+      if (seen_vp.insert(k).second) {
+        if (seen_vp.size() > 512) {
+          seen_vp.clear();
+        }
+        REXGPU_INFO(
+            "[MSXX] clipdis viewport: extent_unscaled={}x{} half_px={} off_add=({:.3f},{:.3f}) "
+            "off_base=({:.3f},{:.3f}) scale_xy=({:.3f},{:.3f}) ndc_off=({:.6f},{:.6f}) "
+            "ndc_scale=({:.6f},{:.6f}) -> px_shift=({:.3f},{:.3f})",
+            dbg_extent_unscaled[0], dbg_extent_unscaled[1], half_px ? 1 : 0, offset_add_xy[0],
+            offset_add_xy[1], offset_base_xy[0], offset_base_xy[1], scale_xy[0], scale_xy[1],
+            ndc_offset[0], ndc_offset[1], ndc_scale[0], ndc_scale[1],
+            ndc_offset[0] * 0.5f * float(dbg_extent_unscaled[0]),
+            ndc_offset[1] * 0.5f * float(dbg_extent_unscaled[1]));
+      }
     }
 
     // Z.
@@ -527,6 +569,37 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
   for (uint32_t i = 0; i < 3; ++i) {
     viewport_info_out.ndc_scale[i] = ndc_scale[i];
     viewport_info_out.ndc_offset[i] = ndc_offset[i];
+  }
+
+  // [MSXX] Diagnostic: half-pixel handling for EVERY draw, including the
+  // clip-ENABLED scene draws that render the low-res (320x240/640x480) playfield
+  // into EDRAM. The in-game image is built by rendering small then point-
+  // upscaling 4x, so a half-pixel offset MISSING on those scene draws becomes a
+  // ~2px shift after upscale (the menu never does this, hence it's correct). Log
+  // the host viewport extent + pix_center + whether +0.5 was applied, deduped per
+  // distinct (extent, pix_center, half_px, clip_disable). Strip once resolved.
+  if (REXCVAR_GET(msxx_diag)) {
+    const bool half_px_dbg =
+        REXCVAR_GET(half_pixel_offset) && pa_su_vtx_cntl.pix_center == xenos::PixelCenter::kD3DZero;
+    static std::unordered_set<uint64_t> seen_vp_all;
+    const uint64_t vk = (uint64_t(viewport_info_out.xy_extent[0]) << 0) ^
+                        (uint64_t(viewport_info_out.xy_extent[1]) << 16) ^
+                        (uint64_t(uint32_t(pa_su_vtx_cntl.pix_center)) << 32) ^
+                        (uint64_t(half_px_dbg) << 33) ^
+                        (uint64_t(pa_cl_clip_cntl.clip_disable) << 34);
+    if (seen_vp_all.insert(vk).second) {
+      if (seen_vp_all.size() > 512) {
+        seen_vp_all.clear();
+      }
+      REXGPU_INFO(
+          "[MSXX] draw vp: extent={}x{} off=({},{}) pix_center={} half_px_applied={} "
+          "clip_disable={} off_add=({:.3f},{:.3f}) ndc_off=({:.6f},{:.6f})",
+          viewport_info_out.xy_extent[0], viewport_info_out.xy_extent[1],
+          viewport_info_out.xy_offset[0], viewport_info_out.xy_offset[1],
+          uint32_t(pa_su_vtx_cntl.pix_center), half_px_dbg ? 1 : 0,
+          uint32_t(pa_cl_clip_cntl.clip_disable), offset_add_xy[0], offset_add_xy[1], ndc_offset[0],
+          ndc_offset[1]);
+    }
   }
 }
 
@@ -1009,6 +1082,35 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   info_out.copy_dest_base = copy_dest_base_adjusted;
   info_out.copy_dest_extent_start = copy_dest_extent_start;
   info_out.copy_dest_extent_length = copy_dest_extent_end - copy_dest_extent_start;
+
+  // [MSXX] Diagnostic: the in-game offset is specific to EDRAM-resolved (tiled)
+  // textures, while the menu (linear textures, same draw geometry) is correct.
+  // So the ~2px shift is introduced when EDRAM is resolved into the tiled
+  // texture. Log the resolve source rect (EDRAM pixels, after the half-pixel
+  // reverse at the top of this function and scissor/alignment), the half-pixel
+  // value actually applied, and the dest, once per distinct resolve. If x0/y0 is
+  // non-zero or the rect is mis-sized vs the RT, that's the source of the shift.
+  // Strip once resolved. half_pixel_offset here is the function-local float.
+  if (REXCVAR_GET(msxx_diag)) {
+    static std::unordered_set<uint64_t> seen_resolve;
+    const uint64_t rk = (uint64_t(rb_copy_dest_base) << 8) ^ (uint64_t(uint32_t(x0)) << 0) ^
+                        (uint64_t(uint32_t(y0)) << 13) ^ (uint64_t(uint32_t(x1)) << 26) ^
+                        (uint64_t(uint32_t(y1)) << 39);
+    if (seen_resolve.insert(rk).second) {
+      if (seen_resolve.size() > 512) {
+        seen_resolve.clear();
+      }
+      REXGPU_INFO(
+          "[MSXX] resolve: src_rect=({},{})..({},{}) [{}x{}] half_px={:.1f} pix_center={} "
+          "win_off_ena={} win_off=({},{}) dest_base={:08X} dest_pitch={} fmt={}",
+          x0, y0, x1, y1, x1 - x0, y1 - y0, half_pixel_offset,
+          uint32_t(regs.Get<reg::PA_SU_VTX_CNTL>().pix_center),
+          uint32_t(regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable),
+          int32_t(pa_sc_window_offset.window_x_offset),
+          int32_t(pa_sc_window_offset.window_y_offset), rb_copy_dest_base << 12,
+          uint32_t(rb_copy_dest_pitch.copy_dest_pitch), uint32_t(dest_format));
+    }
+  }
 
   // Offset relative to the beginning of the tile to put it in fewer bits.
   uint32_t sample_count_log2_x = uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);

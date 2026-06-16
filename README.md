@@ -1,3 +1,5 @@
+Modified version of ReXGlue SDK that can run Metal Slug XX.
+
 > [!CAUTION]
 > This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
 
@@ -32,6 +34,100 @@ Latest SDK builds and releases are published on [GitHub Releases](https://github
 ## Quickstart
 
 For quick start guide, full CLI reference, and config file options, see the [wiki](https://github.com/rexglue/rexglue-sdk/wiki).
+
+## Building Metal Slug XX from source
+
+These steps compile the recompiled C++ into the two binaries the game needs:
+
+- **`rexruntime.dll` / `rexruntimerd.dll`** — the SDK runtime (everything under `src/`). Built from the SDK source tree.
+- **`metalslugxx.exe`** — the recompiled game host (everything under `metalslugxx/`).
+
+The game consumes the SDK via `add_subdirectory` (`-DREXSDK_DIR=../`), so a single
+build configures and compiles **both** at once. Editing anything in the SDK's
+`src/` rebuilds the runtime DLL; editing `metalslugxx/src/` rebuilds the exe.
+
+### Prerequisites
+
+- **Visual Studio 2022** (the Build Tools workload is enough). The presets use
+  bare `clang`/`clang++` + `lld-link` against the MSVC toolchain and UCRT, so a VS
+  Developer environment (`vcvars64.bat`) must populate `INCLUDE`/`LIB`/`PATH`
+  before CMake runs.
+- **Clang/LLVM 18 or newer** with `clang` and `clang++` on `PATH`.
+- **CMake 3.25+** and **Ninja**.
+
+### Build (the easy way)
+
+From a normal terminal, run the helper script for the configuration you want.
+Each one calls `vcvars64.bat`, configures the CMake preset with `-DREXSDK_DIR=../`,
+and builds:
+
+```bat
+metalslugxx\scripts\build-rlsdebug.bat   :: RelWithDebInfo -> metalslugxx.exe + rexruntimerd.dll
+metalslugxx\scripts\build-release.bat    :: Release        -> metalslugxx.exe + rexruntime.dll
+```
+
+> The scripts hardcode `C:\Program Files\Microsoft Visual Studio\2022\Community\...`.
+> If VS is installed elsewhere (e.g. Professional/Enterprise/BuildTools), edit the
+> `vcvars64.bat` path at the top of the script.
+
+### Build (manual steps)
+
+Equivalent to what the scripts do, from a **VS Developer (x64) prompt** with the
+working directory at the `metalslugxx/` folder:
+
+```bat
+:: Configure (point the build at the SDK source tree one level up)
+cmake --preset win-amd64-relwithdebinfo -DREXSDK_DIR=../
+
+:: Compile both the runtime DLL and the game exe
+cmake --build --preset win-amd64-relwithdebinfo
+```
+
+Swap `relwithdebinfo` for `release` (or `debug`) to change configuration.
+
+### Output
+
+Both binaries land side-by-side in the preset's build directory:
+
+| Configuration | Path | Runtime DLL |
+| --- | --- | --- |
+| RelWithDebInfo | `metalslugxx/out/build/win-amd64-relwithdebinfo/metalslugxx.exe` | `rexruntimerd.dll` |
+| Release | `metalslugxx/out/build/win-amd64-release/metalslugxx.exe` | `rexruntime.dll` |
+| Debug | `metalslugxx/out/build/win-amd64-debug/metalslugxx.exe` | `rexruntimed.dll` |
+
+The `.exe` loads the matching `.dll` from its own directory, so keep them together.
+
+### Regenerating the recompiled C++ (optional)
+
+The lifted PPC→C++ sources are already committed under `metalslugxx/generated/`.
+You only need to re-run codegen if you change the lifting hints (the
+`metalslugxx_*.toml` files) or the source XEX. To regenerate, then rebuild:
+
+```bat
+cmake --build --preset win-amd64-relwithdebinfo --target metalslugxx_codegen
+cmake --build --preset win-amd64-relwithdebinfo
+```
+
+### Building only the SDK runtime DLL (optional)
+
+To build the runtime DLL without the game, configure and build the SDK root
+directly from a VS Developer prompt at the repository root:
+
+```bat
+cmake --preset win-amd64
+cmake --build --preset win-amd64-relwithdebinfo   :: or win-amd64-release
+```
+
+The DLL is written to `out/win-amd64/<Config>/rexruntime[rd].dll`.
+
+### Running
+
+Running needs no VS environment. Point the host at your extracted game data:
+
+```bat
+cd metalslugxx\out\build\win-amd64-relwithdebinfo
+metalslugxx.exe --game_data_root "C:\path\to\MSXX"
+```
 
 # **Disclaimer**
 ReXGlue is not affiliated with nor endorsed by Microsoft or Xbox. It is an independent project created for educational and development purposes. All trademarks and copyrights belong to their respective owners. 

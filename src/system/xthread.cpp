@@ -979,6 +979,30 @@ uint32_t XThread::SelfSuspend() {
 }
 #endif
 
+namespace {
+// Sleep off the bulk of the wait, then spin-wait (yielding) the final margin so
+// the wakeup lands on the deadline instead of overshooting it by the OS timer
+// granularity. Portable: steady_clock is QPC-backed on Windows.
+void PreciseDelayMillis(uint32_t timeout_ms) {
+  constexpr auto kSpinMargin = std::chrono::microseconds(1500);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  for (;;) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      break;
+    }
+    const auto remaining = deadline - now;
+    if (remaining > kSpinMargin) {
+      // Leave the margin for the spin; one OS sleep is enough at this scale.
+      rex::thread::Sleep(
+          std::chrono::duration_cast<std::chrono::microseconds>(remaining - kSpinMargin));
+    } else {
+      rex::thread::MaybeYield();
+    }
+  }
+}
+}  // namespace
+
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
   int64_t timeout_ticks = interval;
   uint32_t timeout_ms;
@@ -1010,6 +1034,10 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
       } else {
         rex::thread::MaybeYield();
       }
+    } else if (rex::thread::PreciseTimedWaitEnabled()) {
+      // Spin off the final sub-millisecond so frame-pacing waits land on the
+      // deadline rather than overshooting the OS timer granularity.
+      PreciseDelayMillis(timeout_ms);
     } else {
       rex::thread::Sleep(std::chrono::milliseconds(timeout_ms));
     }
@@ -1435,3 +1463,17 @@ void XHostThread::Execute() {
 }
 
 }  // namespace rex::system
+
+namespace rex::thread {
+// Process-wide opt-in for precise timed waits (see thread.h). Read on the guest
+// frame-pacing path (XThread::Delay) and toggled from app setup.
+namespace {
+std::atomic<bool> g_precise_timed_wait{false};
+}  // namespace
+void SetPreciseTimedWait(bool enable) {
+  g_precise_timed_wait.store(enable, std::memory_order_relaxed);
+}
+bool PreciseTimedWaitEnabled() {
+  return g_precise_timed_wait.load(std::memory_order_relaxed);
+}
+}  // namespace rex::thread

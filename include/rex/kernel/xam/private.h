@@ -19,6 +19,14 @@ namespace xam {
 
 bool xeXamIsUIActive();
 
+// Local co-op support. Returns true if guest user slot `user_index` should be
+// reported as a signed-in local user. Slot 0 is always signed in (P1, matching
+// the single loaded user profile). Slots 1..3 are signed in only when the
+// `local_coop` cvar is enabled AND a controller is actually connected at that
+// slot, so single-player (one pad) never spuriously gains extra users.
+// Defined in xam_input.cpp (it needs the input system).
+bool xeXamUserIsLocallySignedIn(uint32_t user_index);
+
 rex::runtime::Export* RegisterExport_xam(rex::runtime::Export* export_entry);
 
 // Registration functions, one per file.

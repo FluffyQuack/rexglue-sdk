@@ -38,6 +38,66 @@ static const char* kGameContentHeaderDirName = "Headers";
 
 static int content_device_id_ = 0;
 
+// A content's file_name is a fixed 42-byte field supplied by the (untrusted)
+// guest. It is normally ASCII, but a game may leave it uninitialized or pack a
+// binary marketplace id into it, so the bytes are not guaranteed to be valid
+// UTF-8. Converting such bytes straight through to_path() (strict UTF-8) throws
+// and crashes the host, so replace any invalid byte/sequence with '_' first --
+// a malformed name simply resolves to a path that does not exist. Valid
+// (including multi-byte) UTF-8 is preserved.
+static std::string SanitizeContentName(const std::string& name) {
+  std::string out;
+  out.reserve(name.size());
+  const size_t n = name.size();
+  for (size_t i = 0; i < n;) {
+    const unsigned char c = static_cast<unsigned char>(name[i]);
+    size_t len;
+    uint32_t cp;
+    if (c < 0x80) {
+      len = 1;
+      cp = c;
+    } else if ((c & 0xE0) == 0xC0) {
+      len = 2;
+      cp = c & 0x1F;
+    } else if ((c & 0xF0) == 0xE0) {
+      len = 3;
+      cp = c & 0x0F;
+    } else if ((c & 0xF8) == 0xF0) {
+      len = 4;
+      cp = c & 0x07;
+    } else {
+      out += '_';
+      ++i;
+      continue;
+    }
+    if (i + len > n) {
+      out += '_';
+      ++i;
+      continue;
+    }
+    bool ok = true;
+    for (size_t k = 1; k < len; ++k) {
+      const unsigned char cc = static_cast<unsigned char>(name[i + k]);
+      if ((cc & 0xC0) != 0x80) {
+        ok = false;
+        break;
+      }
+      cp = (cp << 6) | (cc & 0x3F);
+    }
+    // Reject malformed continuation, surrogates, out-of-range, and overlong
+    // encodings (anything that strict UTF-8 decoding would also reject).
+    static constexpr uint32_t kMinForLen[5] = {0, 0, 0x80, 0x800, 0x10000};
+    if (!ok || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) || cp < kMinForLen[len]) {
+      out += '_';
+      ++i;
+      continue;
+    }
+    out.append(name, i, len);
+    i += len;
+  }
+  return out;
+}
+
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
                                const std::filesystem::path& package_path)
@@ -111,7 +171,7 @@ std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
   // Content path:
   // content_root/xuid/title_id/content_type/data_file_name/
   auto package_root = ResolvePackageRoot(used_xuid, data.content_type, data.title_id);
-  return package_root / rex::to_path(data.file_name());
+  return package_root / rex::to_path(SanitizeContentName(data.file_name()));
 }
 
 std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string_view file_name,
@@ -156,8 +216,14 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     }
 
     XCONTENT_AGGREGATE_DATA content_data;
-    if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
-                                         content_type, content_data))) {
+    // ReadContentHeaderFile returns Win32-style X_ERROR_* codes (X_ERROR_SUCCESS
+    // == 0, X_ERROR_FILE_NOT_FOUND == 2), NOT NTSTATUS. XSUCCEEDED only clears the
+    // NTSTATUS severity bits (s & 0xC0000000), so XSUCCEEDED(X_ERROR_FILE_NOT_FOUND)
+    // is TRUE -- which would emplace an uninitialized content_data (garbage
+    // file_name/display_name) for every package that has no .header file, instead
+    // of falling back to the directory name below. Compare against success exactly.
+    if (ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id, content_type,
+                              content_data) == X_ERROR_SUCCESS) {
       result.emplace_back(std::move(content_data));
     } else {
       content_data.device_id = device_id;

@@ -132,6 +132,23 @@ SleepResult AlertableSleep(std::chrono::duration<Rep, Period> duration) {
   return AlertableSleep(std::chrono::duration_cast<std::chrono::microseconds>(duration));
 }
 
+// Precise timed-wait mode.
+//
+// Guest timed delays (KeDelayExecutionThread, the main frame-pacing throttle)
+// are normally lowered onto a plain OS Sleep, whose wakeup is only as precise as
+// the system timer resolution (~1 ms even with timeBeginPeriod(1), and it only
+// guarantees *at least* the requested time -- it can overshoot). For a
+// fixed-tick title that throttles every ~16.6 ms, a sub-millisecond overshoot
+// each frame can accumulate into visible pacing jitter.
+//
+// When precise mode is enabled, XThread::Delay sleeps off the bulk of the
+// interval and then spin-waits (yielding) the final ~1.5 ms so it lands on the
+// deadline instead of past it. This trades a little CPU for tighter pacing. It
+// is OFF by default; opt in per-title (e.g. from a config file). Reads/writes
+// are atomic and may be toggled at runtime.
+void SetPreciseTimedWait(bool enable);
+bool PreciseTimedWaitEnabled();
+
 typedef uint32_t TlsHandle;
 constexpr TlsHandle kInvalidTlsHandle = UINT_MAX;
 
