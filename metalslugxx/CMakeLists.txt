@@ -16,7 +16,7 @@ set(METALSLUGXX_SOURCES
     src/metalslugxx_hooks.cpp
     src/metalslugxx_crash.cpp
     src/metalslugxx_timing.cpp
-    src/metalslugxx_config.cpp
+    src/metalslugxx_settings.cpp
     src/metalslugxx_dlc.cpp
     src/metalslugxx_screenshot.cpp
     # Vendored lodepng (zlib license) - PNG encoder for the F12 guest-output

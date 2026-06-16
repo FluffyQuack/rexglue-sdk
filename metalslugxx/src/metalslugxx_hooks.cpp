@@ -6,7 +6,7 @@
 
 #include <rex/hook.h>
 
-#include "metalslugxx_config.h"
+#include "metalslugxx_settings.h"
 
 // ---------------------------------------------------------------------------
 // [Game] SkipLogos — skip the boot logo sequence.
@@ -34,4 +34,24 @@
 // whose name matches the hooks' `name`.
 bool msxx_skip_boot_logos() {
   return metalslugxx::config().skip_logos;
+}
+
+// ---------------------------------------------------------------------------
+// [Game] Integer playfield scale.
+//
+// ms_present_playfield_upscale builds the final quad for the 640x480
+// intermediate playfield texture. Stock code letterboxes the original 320x240
+// content to 864x648 inside the 1280x720 frame (2.7x from the original pixel
+// buffer). When the user requests point filtering, force the quad to a centered
+// 960x720 rectangle so the combined 320x240 -> screen scale is exactly 3.0x.
+void msxx_force_integer_playfield_scale(PPCRegister& left, PPCRegister& top,
+                                        PPCRegister& right, PPCRegister& bottom) {
+  if (metalslugxx::config().game_upscale_filter != "point") {
+    return;
+  }
+
+  left.f64 = 160.0;
+  top.f64 = 0.0;
+  right.f64 = 1120.0;
+  bottom.f64 = 720.0;
 }

@@ -11,7 +11,7 @@
 #include <rex/thread.h>
 #include <rex/ui/keybinds.h>
 
-#include "metalslugxx_config.h"
+#include "metalslugxx_settings.h"
 #include "metalslugxx_crash.h"
 #include "metalslugxx_dlc.h"
 #include "metalslugxx_screenshot.h"
@@ -38,7 +38,7 @@ class MetalslugxxApp : public rex::ReXApp {
 
     // Read metalslugxx.ini (writing defaults on first run). When Sleep = False,
     // switch guest frame-pacing waits to the spin-to-deadline path so they don't
-    // overshoot the OS timer granularity (see metalslugxx_config.h).
+    // overshoot the OS timer granularity (see metalslugxx_settings.h).
     const metalslugxx::Config& cfg = metalslugxx::LoadConfig();
     rex::thread::SetPreciseTimedWait(!cfg.sleep);
 
@@ -75,7 +75,7 @@ class MetalslugxxApp : public rex::ReXApp {
     // sprite/background atlas draws (tiled=0) and the tiled (EDRAM-resolved)
     // render-target upscale that builds the playfield. This cvar lets the SDK
     // force linear/point on *all* of those samples (default = keep the game's own
-    // filtering). See metalslugxx_config.h [Graphics] GameUpscaleFilter.
+    // filtering). See metalslugxx_settings.h [Graphics] GameUpscaleFilter.
     rex::cvar::SetFlagByName("game_upscale_filter", cfg.game_upscale_filter);
     REXLOG_INFO("graphics: GameUpscaleFilter -> game_upscale_filter = {}", cfg.game_upscale_filter);
 
@@ -93,7 +93,7 @@ class MetalslugxxApp : public rex::ReXApp {
 
     // Diagnostic sample-phase bias for the in-game upscale "shuffling". Drives
     // the SDK `game_sample_texel_bias` cvar (texels added to 2D sample coords).
-    // 0 = stock. See metalslugxx_config.h [Graphics] SampleTexelBias. Only
+    // 0 = stock. See metalslugxx_settings.h [Graphics] SampleTexelBias. Only
     // applied when the INI explicitly set it, so a command-line
     // `--game_sample_texel_bias=...` (parsed during cvar::Init) is not clobbered.
     if (cfg.sample_texel_bias_set) {
@@ -107,7 +107,7 @@ class MetalslugxxApp : public rex::ReXApp {
 
     // Empirical fix for the in-game ~2px up-left offset. Drives the SDK
     // `game_lowres_tiled_bias` cvar (texels added to LOW-RES tiled 2D sample
-    // coords only). 0 = stock. See metalslugxx_config.h [Graphics] LowresTiledBias.
+    // coords only). 0 = stock. See metalslugxx_settings.h [Graphics] LowresTiledBias.
     // Only applied when the INI explicitly set it, so a command-line
     // `--game_lowres_tiled_bias=...` is not clobbered.
     if (cfg.lowres_tiled_bias_set) {
@@ -123,7 +123,7 @@ class MetalslugxxApp : public rex::ReXApp {
     // cvars from the INI [Keyboard1]/[Keyboard2] sections (key NAMES, validated
     // on load). The drivers read these per-frame, so setting them here is in
     // time. [Keyboard2] is a second local player on the same keyboard and is
-    // disabled by default. See metalslugxx_config.h and
+    // disabled by default. See metalslugxx_settings.h and
     // src/input/keyboard/keyboard_input_driver.cpp.
     rex::cvar::SetFlagByName("keyboard_mode", cfg.keyboard_enabled ? "true" : "false");
     rex::cvar::SetFlagByName("kb_dpad_up", cfg.kb_dpad_up);
@@ -184,11 +184,11 @@ class MetalslugxxApp : public rex::ReXApp {
 
   // On quit, re-write metalslugxx.ini from the live config so an INI from an
   // older build gets any newly-added keys populated (and comments refreshed),
-  // while keeping whatever the user already set. See metalslugxx_config.h.
+  // while keeping whatever the user already set. See metalslugxx_settings.h.
   void OnShutdown() override { metalslugxx::SaveConfig(); }
 
   // Resolve the writable-data paths before the runtime locks them in. Two
-  // project conventions (see metalslugxx_config.h):
+  // project conventions (see metalslugxx_settings.h):
   //   1. If --game_data_root was not given, default it to the working directory
   //      (`./`) so the game runs against the data sitting next to it.
   //   2. [System] Portable (default True) keeps the install self-contained: the

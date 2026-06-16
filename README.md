@@ -24,6 +24,18 @@ ReXGlue is heavily rooted on the foundations of [Xenia](https://github.com/xenia
 
 Latest SDK builds and releases are published on [GitHub Releases](https://github.com/rexglue/rexglue-sdk/releases). Join the [Discord server](https://discord.gg/CNTxwSNZfT) for updates and share what you have created.
 
+## Build cheat sheet
+
+Compile MS XX (from metalslugxx)
+- "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+- cmake --preset win-amd64-relwithdebinfo -DREXSDK_DIR=../
+- cmake --build --preset win-amd64-relwithdebinfo --target metalslugxx_codegen
+- cmake --build --preset win-amd64-relwithdebinfo
+
+Recompile default.xex (run from root):
+- H:\projects\codework\misc-github\rexglue-sdk-wip\out\win-amd64\rexglue.exe codegen H:\projects\codework\misc-github\rexglue-sdk-wip\metalslugxx\metalslugxx_manifest.toml
+- cmake --build --preset win-amd64-relwithdebinfo 
+
 ## Builds
 
 | Channel | CI | Download |
@@ -101,7 +113,8 @@ The `.exe` loads the matching `.dll` from its own directory, so keep them togeth
 
 The lifted PPC→C++ sources are already committed under `metalslugxx/generated/`.
 You only need to re-run codegen if you change the lifting hints (the
-`metalslugxx_*.toml` files) or the source XEX. To regenerate, then rebuild:
+`metalslugxx_*.toml` files) or the source XEX. From the `metalslugxx/` project
+directory, regenerate and rebuild with:
 
 ```bat
 cmake --build --preset win-amd64-relwithdebinfo --target metalslugxx_codegen

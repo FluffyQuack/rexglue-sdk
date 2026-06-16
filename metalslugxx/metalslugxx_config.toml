@@ -42,16 +42,23 @@
 "0x8257F6D0" = { size = 0x38, name = "sub_8257F6D0" }     # back-edge target 0x8257F6E4
 "0x8257F708" = { size = 0x38, name = "sub_8257F708" }     # back-edge target 0x8257F71C
 
+# W2/W3 write-phase warning fix (2026-06-16): shared return fragments, not
+# switch-table bodies. Register as tiny CONFIG helpers so conditional branches
+# lower as conditional tail-calls instead of unresolved runtime guards.
+"0x826A0A28" = { size = 0x0C, name = "msxx_hresult_fail_826A0A28" }  # HRESULT 0x80004005 return fragment used by 0x826A0A34
+"0x827DEEF4" = { size = 0x08, name = "msxx_return_r11_827DEEF4" }     # `mr r3,r11 ; blr` return fragment used by 0x827DEEFC
+
 # ---------------------------------------------------------------------------
 # Reverse-engineered names (2026-06-14). Friendly names for functions we have
 # disassembled and understood during Phase E/F, so REX_FATAL traces and crash
 # backtraces read meaningfully instead of as bare sub_<addr>. Names only (codegen
 # auto-sizes); see MSXX_RUNTIME_NOTES.md "Function map" for the full annotations.
-# (0x82452878 keeps its IDA size hint; named in place lower in this file. The
-#  fiber family 0x8242AA10/AAA0/AAF0/ABD0 + SwitchToFiber 0x8242D230 are named
-#  via [rexcrt] above.)
+# (0x82452878 keeps its IDA size hint here. The fiber family
+#  0x8242AA10/AAA0/AAF0/ABD0 + SwitchToFiber 0x8242D230 are named via [rexcrt]
+#  below.)
 # ---------------------------------------------------------------------------
 "0x8245E2F0" = { name = "ms_vblank_handler" }       # vblank ISR body; bumps the sw vblank counter at [gpu_base+0x4174]
+"0x82452878" = { size = 0x94, name = "ms_graphics_isr" }   # SetInterruptCallback target; source-0 (vblank) dispatch -> ms_vblank_handler
 "0x823DFA28" = { name = "ms_task_scheduler" }       # cooperative task scheduler; drives the fiber switch via the ctx_swap trampoline
 "0x8242AC30" = { name = "ms_ctx_swap_trampoline" }  # lone `b 0x8242D230` into SwitchToFiber (now redirected via [rexcrt])
 
@@ -63,6 +70,17 @@
 "0x8256D288" = { name = "ms_load_arcade_logo" }    # loads game:\media\ArcadeLogo.ptc (the XBLA "Arcade" logo)
 "0x8256D438" = { name = "ms_load_esrb_logo" }      # loads the ESRB rating logo (US region only)
 "0x8256D490" = { name = "ms_load_vendor_logo" }    # loads VendorLogoTexture01 (the SNK Playmore logo)
+
+# Playfield render/upscale path (RE'd for the 3.0x pixel scale patch).
+# The game renders into a 320x240 target, doubles that through a 640x480
+# intermediate, then draws the intermediate into a letterboxed screen-space quad.
+# The final quad calculation originally reserves 5% top/bottom margin, producing
+# a centered 864x648 viewport; see the [[midasm_hook]] below.
+"0x823E6BB8" = { name = "ms_init_playfield_upscale_state" }      # zeroes state; default source size = 320x240
+"0x823E6C70" = { name = "ms_create_playfield_upscale_targets" }  # allocs 320x240 source target and 640x480 intermediate target
+"0x823E6DF0" = { name = "ms_upscale_playfield_to_640x480" }      # draws the 320x240 source into the 640x480 intermediate
+"0x823E7310" = { name = "ms_present_playfield_upscale" }         # draws the final intermediate quad to the 1280x720 frame
+"0x823E7830" = { name = "ms_ensure_playfield_upscale_targets" }  # lazy init for the playfield upscale targets
 
 # ---------------------------------------------------------------------------
 # Phase D, pass 1 (2026-06-13): resolve compile errors of the form
@@ -84,6 +102,11 @@
 #   loc_828BEC98 / loc_828BED38 / loc_828BED3C / loc_828BED50. Next real
 #   function is sub_828BED60, so size = 0x828BED60 - 0x828BE7E8 = 0x578.
 "0x828BE7E8" = { size = 0x578, name = "sub_828BE7E8" }    # shares tail w/ sub_828BE938
+
+# Entry 1 in the Mission 5 stream jump table lands in the middle of the
+# 0x822CC498 dispatcher. Other table users reach it through indirect bctr/bctrl,
+# so it needs to be registered as an overlapping callable chunk.
+"0x822CC4C0" = { size = 0x34, name = "ms_mission5_stream_dispatch_cont" }
 
 # ---------------------------------------------------------------------------
 # Phase E, run 3 fix (2026-06-14): resolve W1. After Run 2 (callback recovery)
@@ -165,21 +188,9 @@ DeleteFiber          = 0x8242ABD0
 SwitchToFiber        = 0x8242D230
 
 # ---------------------------------------------------------------------------
-# DEFERRED to Phase E — 2 remaining non-fatal Write-phase warnings (W2, W3).
-# Codegen completed and emitted these branch paths as REX_FATAL("Unresolved ...")
-# runtime guards, so the generated tree is complete and compiles; only these
-# specific paths trap *if executed*. Both are back-edges into out-of-line switch
-# case bodies that live AFTER a `bctr`, so the fix needs the jump table resolved
-# (the [[switch_tables]] / explicit-size remedy from the Phase D note), not just
-# a boundary hint. Not yet hit on the boot path (the trap order is W1 first), so
-# left deferred until a guard fires — then come back with the trace.
-#
-#   W2  bgt 0x826A0A28 from 0x826A0A50 — back-edge inside a jump-table function
-#       (case bodies after the bctr at 0x826A0A0C; table base 0x826A0504, 16-bit
-#       offset table at 0x821453C8). Likely needs [[switch_tables]] for that
-#       table, not just a boundary hint.
-#   W3  bne 0x827DEEF4 from 0x827DEF18 — back-edge in an indirect-dispatch helper
-#       (blocks after the bctr at 0x827DEEE4, tail bctr at 0x827DEF28).
+# W2/W3 resolved 2026-06-16. The old jump-table hypothesis for
+# 0x826A0A28/0x827DEEF4 was disproven by disassembly; both targets are shared
+# return fragments now registered in [functions] above.
 # ---------------------------------------------------------------------------
 0x821F07C0 = { size = 0x7C }
 0x821F10D8 = { size = 0x60 }
@@ -3174,7 +3185,6 @@ SwitchToFiber        = 0x8242D230
 0x82441238 = { size = 0xD4 }
 0x82441358 = { size = 0xC8 }
 0x82444278 = { size = 0x26C }
-0x82452878 = { size = 0x94, name = "ms_graphics_isr" }   # SetInterruptCallback target; source-0 (vblank) dispatch -> ms_vblank_handler
 0x8245E408 = { size = 0x1AC }
 0x82460418 = { size = 0x8C }
 0x82461FE0 = { size = 0x194 }
@@ -4278,6 +4288,42 @@ SwitchToFiber        = 0x8242D230
 0x82BC39A0 = { size = 0x108 }
 
 # ---------------------------------------------------------------------------
+# Mission 5 stream dispatcher crash (2026-06-16).
+#
+# The table at 0x82014FF4 has five valid entries. Auto-detection previously
+# truncated the local bctr sites in sub_822CC498 to cases 0 and 1; after those
+# were fixed, Mission 5 reached sibling same-table dispatch and selected entry 1
+# (0x822CC4C0). That target is a valid chunk entry, not a standalone auto-found
+# function, so it is registered above and the remaining bctr sites are tabled
+# here. The bctrl sites still use REX_CALL_INDIRECT_FUNC today, so they rely on
+# the 0x822CC4C0 chunk registration.
+# ---------------------------------------------------------------------------
+[[switch_tables]]
+address = 0x822CC490
+register = 11
+labels = [0x822CC498, 0x822CC4C0, 0x822CC8D8, 0x822CC4F8, 0x822CC560]
+
+[[switch_tables]]
+address = 0x822CC4BC
+register = 6
+labels = [0x822CC498, 0x822CC4C0, 0x822CC8D8, 0x822CC4F8, 0x822CC560]
+
+[[switch_tables]]
+address = 0x822CC4F0
+register = 11
+labels = [0x822CC498, 0x822CC4C0, 0x822CC8D8, 0x822CC4F8, 0x822CC560]
+
+[[switch_tables]]
+address = 0x822CC8D0
+register = 8
+labels = [0x822CC498, 0x822CC4C0, 0x822CC8D8, 0x822CC4F8, 0x822CC560]
+
+[[switch_tables]]
+address = 0x822CC958
+register = 11
+labels = [0x822CC498, 0x822CC4C0, 0x822CC8D8, 0x822CC4F8, 0x822CC560]
+
+# ---------------------------------------------------------------------------
 # Mid-ASM hooks
 # ---------------------------------------------------------------------------
 #
@@ -4300,6 +4346,20 @@ SwitchToFiber        = 0x8242D230
 # when msxx_skip_boot_logos() (metalslugxx_hooks.cpp, reads [Game] SkipLogos) is
 # true, jumps to the instruction just past the loop instead of looping again.
 # When false the loop runs normally (the hook is a cheap bool read per frame).
+
+# [Game] Integer playfield scale (only when [Graphics] GameUpscaleFilter = Point).
+#
+# ms_present_playfield_upscale (0x823E7310) computes four FP registers before it
+# emits the final playfield quad:
+#   f31 = left, f30 = top, f28 = right, f27 = bottom
+#
+# Stock:  (208, 36) -> (1072, 684), i.e. 864x648 == 2.7x from 320x240.
+# Point patch: (160, 0) -> (1120, 720), i.e. 960x720 == 3.0x from 320x240.
+[[midasm_hook]]
+address = 0x823E7664
+name = "msxx_force_integer_playfield_scale"
+registers = ["f31", "f30", "f28", "f27"]
+after_instruction = false
 
 # XBLA "Arcade": tick 0x8256F420; loop 0x82571600; exit -> 0x82571610.
 [[midasm_hook]]
