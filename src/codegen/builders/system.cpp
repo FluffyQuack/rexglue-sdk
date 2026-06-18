@@ -148,12 +148,16 @@ bool build_dcbtst(BuilderContext& ctx) {
 }
 
 bool build_dcbz(BuilderContext& ctx) {
-  // Compute EA, align to 32-byte cache line, apply physical offset
+  // Compute EA, align to 128-byte cache line, apply physical offset.
+  // The Xbox 360 Xenon PPE has 128-byte cache lines, so plain `dcbz` zeroes
+  // 128 bytes (there is no 32-byte form on this target). Modeling it as 32
+  // leaves 96 of every 128 bytes as garbage and silently corrupts any struct a
+  // compiler zero-inits via a dcbz-strided memset. Matches build_dcbzl below.
   ctx.print("\t{} = (", ctx.ea());
   if (ctx.insn.operands[0] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[0]));
-  ctx.println("{}.u32) & ~31;", ctx.r(ctx.insn.operands[1]));
-  ctx.println("\tmemset((void*)REX_RAW_ADDR({}), 0, 32);", ctx.ea());
+  ctx.println("{}.u32) & ~127;", ctx.r(ctx.insn.operands[1]));
+  ctx.println("\tmemset((void*)REX_RAW_ADDR({}), 0, 128);", ctx.ea());
   return true;
 }
 
