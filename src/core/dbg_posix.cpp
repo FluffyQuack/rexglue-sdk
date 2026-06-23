@@ -58,4 +58,9 @@ void DebugPrint(const char* s) {
 }
 }  // namespace detail
 
+void DumpThreadBacktrace(void* /*native_thread_handle*/, const char* /*reason*/) {
+  // Not implemented on POSIX; the audio watchdog still detects the wedge and
+  // logs it, just without a symbolized stack.
+}
+
 }  // namespace rex::debug

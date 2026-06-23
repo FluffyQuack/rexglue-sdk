@@ -51,6 +51,10 @@ bool SDLAudioDriver::Initialize() {
   }
   sdl_initialized_ = true;
 
+  return OpenStream();
+}
+
+bool SDLAudioDriver::OpenStream() {
   SDL_AudioSpec desired_spec = {};
   SDL_AudioSpec obtained_spec = {};
   desired_spec.freq = frame_frequency_;
@@ -116,18 +120,47 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
 
-  static uint32_t sdl_submit_count = 0;
-  if (sdl_submit_count < 10) {
-    REXAPU_DEBUG("SDLAudioDriver::SubmitFrame: frame_ptr={:08X} queued_count={}", frame_ptr,
-                 frames_queued_.size() + 1);
-    sdl_submit_count++;
-  }
-
   {
     std::unique_lock<std::mutex> guard(frames_mutex_);
     frames_queued_.push(output_frame);
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
   }
+}
+
+size_t SDLAudioDriver::GetQueuedFrameCount() const {
+  std::unique_lock<std::mutex> guard(frames_mutex_);
+  return frames_queued_.size();
+}
+
+AudioDriverHealth SDLAudioDriver::GetHealth() const {
+  AudioDriverHealth health;
+  health.backend_callbacks = backend_callbacks_.load(std::memory_order_relaxed);
+  health.frames_consumed = frames_consumed_.load(std::memory_order_relaxed);
+  health.silence_fills = silence_fills_.load(std::memory_order_relaxed);
+  std::unique_lock<std::mutex> guard(frames_mutex_);
+  health.queued = frames_queued_.size();
+  return health;
+}
+
+// Called by the audio worker when the backend has stopped consuming frames (its
+// callback went silent while the queue still held audio). Tearing down and
+// reopening the stream re-binds to the current default device and restarts the
+// callback. SDL_DestroyAudioStream blocks until any in-flight callback returns,
+// so the queued frames stay valid for the fresh stream to drain.
+bool SDLAudioDriver::RecoverStalledBackend() {
+  if (!sdl_initialized_) {
+    return false;
+  }
+  if (sdl_stream_) {
+    SDL_DestroyAudioStream(sdl_stream_);
+    sdl_stream_ = nullptr;
+  }
+  if (!OpenStream()) {
+    REXAPU_ERROR("SDLAudioDriver: failed to reopen audio stream during recovery");
+    return false;
+  }
+  REXAPU_WARN("SDLAudioDriver: recreated stalled audio stream to recover playback");
+  return true;
 }
 
 void SDLAudioDriver::Shutdown() {
@@ -158,6 +191,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     return;
   }
   const auto driver = static_cast<SDLAudioDriver*>(userdata);
+  driver->backend_callbacks_.fetch_add(1, std::memory_order_relaxed);
   const int sample_count =
       static_cast<int>(channel_samples_ * std::max<uint8_t>(driver->sdl_device_channels_, 1));
   const int len = static_cast<int>(sizeof(float) * sample_count);
@@ -167,18 +201,14 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     return;
   }
   while (additional_amount > 0) {
-    static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
     if (driver->frames_queued_.empty()) {
-      if (sdl_callback_count < 10) {
-        REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
-        sdl_callback_count++;
-      }
       std::memset(data, 0, len);
       if (!SDL_PutAudioStreamData(stream, data, len)) {
         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
         break;
       }
+      driver->silence_fills_.fetch_add(1, std::memory_order_relaxed);
       additional_amount -= len;
     } else {
       auto buffer = driver->frames_queued_.front();
@@ -205,6 +235,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
       }
       driver->frames_unused_.push(buffer);
 
+      driver->frames_consumed_.fetch_add(1, std::memory_order_relaxed);
       auto ret = driver->semaphore_->Release(1, nullptr);
       assert_true(ret);
       additional_amount -= len;

@@ -26,7 +26,42 @@ extern "C" {
 #include "libavutil/log.h"
 }  // extern "C"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+
 REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
+
+REXCVAR_DEFINE_INT32(
+    xma_kick_timeout_ms, 50, "Audio",
+    "Max time (ms) a guest XMA kick waits for the decoder to finish before "
+    "giving up. Bounds the wait so a single missed decode signal cannot hang "
+    "the audio worker and silence all output permanently.");
+REXCVAR_DEFINE_BOOL(
+    xma_diagnostics, false, "Audio",
+    "Log XMA context kick/decode diagnostics (slow decodes, unallocated kicks) "
+    "to help track down audio dropouts.");
+
+namespace {
+
+// Throttled report when a kicked context fails to signal completion in time.
+// A wedged context can fire on every kick (hundreds per second), so log the
+// first several, then only at exponentially spaced counts, to keep the fault
+// visible without flooding the log.
+void ReportKickTimeout(uint32_t context_id, int timeout_ms) {
+  static std::atomic<uint64_t> timeout_count{0};
+  const uint64_t n = timeout_count.fetch_add(1) + 1;
+  const bool power_of_two = (n & (n - 1)) == 0;
+  if (n <= 8 || power_of_two || REXCVAR_GET(xma_diagnostics)) {
+    REXAPU_WARN(
+        "XMA: context {} decode did not complete within {} ms (total timeouts: "
+        "{}). Skipping this frame to avoid a permanent audio dropout. Set "
+        "xma_diagnostics=true for per-event detail.",
+        context_id, timeout_ms, n);
+  }
+}
+
+}  // namespace
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -141,9 +176,24 @@ void XmaDecoder::WorkerThreadMain() {
   while (worker_running_) {
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
+    const bool diagnostics = REXCVAR_GET(xma_diagnostics);
     for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
       XmaContext& context = contexts_[n];
-      bool worked = context.Work();
+      bool worked;
+      if (diagnostics) {
+        // Time each decode so an FFmpeg/decoder stall -- which would starve the
+        // kicking guest thread and trigger its kick timeout -- is attributable
+        // to a specific context.
+        const auto start = std::chrono::steady_clock::now();
+        worked = context.Work();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        if (elapsed.count() >= 5) {
+          REXAPU_WARN("XMA: context {} Work() took {} ms", n, elapsed.count());
+        }
+      } else {
+        worked = context.Work();
+      }
       if (worked) {
         context.SignalWorkDone();
         PROFILE_XMA_FRAME_DECODED();
@@ -295,11 +345,27 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     }
     // Signal the decoder thread to start processing.
     work_event_->Set();
-    // Block until the worker finishes, so the game sees updated context data.
+    // Block until the worker finishes, so the game sees updated context data --
+    // but only up to a bounded timeout. This handler runs on the guest thread
+    // that issued the kick, which is often the audio worker dispatching the
+    // periodic client callback. An unbounded wait here would hang that thread
+    // forever if the worker ever misses a completion signal (auto-reset event
+    // race, context disabled mid-kick, or a decoder stall), draining the audio
+    // queue and silencing ALL output permanently until restart. Timing out
+    // instead degrades a missed decode to a single skipped frame.
+    const auto kick_timeout =
+        std::chrono::milliseconds(std::max(1, REXCVAR_GET(xma_kick_timeout_ms)));
+    const bool diagnostics = REXCVAR_GET(xma_diagnostics);
     for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
       if (kicked_value & 1) {
         uint32_t context_id = base_context_id + i;
-        contexts_[context_id].WaitForWorkDone();
+        if (diagnostics && !contexts_[context_id].is_allocated()) {
+          REXAPU_WARN("XMA: kicked context {} is not allocated; decode will not run",
+                      context_id);
+        }
+        if (!contexts_[context_id].WaitForWorkDone(kick_timeout)) {
+          ReportKickTimeout(context_id, REXCVAR_GET(xma_kick_timeout_ms));
+        }
       }
     }
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {

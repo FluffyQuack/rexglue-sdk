@@ -326,36 +326,41 @@ bool Query<bool>(std::string_view name) {
   return v == "true" || v == "1" || v == "yes";
 }
 
+// Parse an integer cvar value, auto-detecting a 0x/0X hex prefix (std::from_chars
+// itself rejects the prefix and only does one base). Without this, addresses and
+// masks passed as "0x...." silently parse as 0 (everything up to the 'x').
+template <typename T>
+static T ParseIntAuto(std::string_view v) {
+  T out = 0;
+  const size_t sign = (!v.empty() && (v[0] == '+' || v[0] == '-')) ? 1 : 0;
+  if (v.size() >= sign + 2 && v[sign] == '0' && (v[sign + 1] == 'x' || v[sign + 1] == 'X')) {
+    T mag = 0;
+    std::from_chars(v.data() + sign + 2, v.data() + v.size(), mag, 16);
+    out = (sign && v[0] == '-') ? static_cast<T>(static_cast<T>(0) - mag) : mag;
+  } else {
+    std::from_chars(v.data(), v.data() + v.size(), out, 10);  // handles leading sign
+  }
+  return out;
+}
+
 template <>
 int32_t Query<int32_t>(std::string_view name) {
-  std::string v = GetFlagByName(name);
-  int32_t out = 0;
-  std::from_chars(v.data(), v.data() + v.size(), out);
-  return out;
+  return ParseIntAuto<int32_t>(GetFlagByName(name));
 }
 
 template <>
 int64_t Query<int64_t>(std::string_view name) {
-  std::string v = GetFlagByName(name);
-  int64_t out = 0;
-  std::from_chars(v.data(), v.data() + v.size(), out);
-  return out;
+  return ParseIntAuto<int64_t>(GetFlagByName(name));
 }
 
 template <>
 uint32_t Query<uint32_t>(std::string_view name) {
-  std::string v = GetFlagByName(name);
-  uint32_t out = 0;
-  std::from_chars(v.data(), v.data() + v.size(), out);
-  return out;
+  return ParseIntAuto<uint32_t>(GetFlagByName(name));
 }
 
 template <>
 uint64_t Query<uint64_t>(std::string_view name) {
-  std::string v = GetFlagByName(name);
-  uint64_t out = 0;
-  std::from_chars(v.data(), v.data() + v.size(), out);
-  return out;
+  return ParseIntAuto<uint64_t>(GetFlagByName(name));
 }
 
 template <>

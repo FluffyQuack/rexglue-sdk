@@ -1,0 +1,26 @@
+# EXIT 1 — hand-authored boundary fixups (Phase 5 first codegen loop onward).
+#
+# Included from exit1_manifest.toml ([entrypoint].includes), kept SEPARATE from
+# exit1_config.toml so the IDA boundary seed there can be regenerated in
+# overwrite mode without clobbering these comments. Everything here is resolved
+# structurally against Assets/EXIT1/default.disasm.txt; no sizes are guessed.
+# Every entry must explain the exact terminator (b / bctr / blr) that fixes its
+# boundary. Empty until the first UnresolvedCall / indirect-call trap.
+
+[functions]
+# --- Phase 5 first codegen loop: tail-call targets the IDA seed missed ---
+# Both are genuine function entries reached only by an unconditional `b`
+# (tail call), so call-graph discovery flagged them as UnresolvedCall
+# ("target not in any function"). Each begins immediately after an
+# unconditional branch that terminates the preceding function, which proves it
+# is a real entry (not a mid-function label). Auto-sized (no guessed size).
+#
+# 0x82040250: tail-called by `b 0x82040250` @ 0x820408C4. Preceded by
+#   `8204024C: b 0x820400C0` (uncond terminator ends prior fn). Body opens
+#   `cmplwi cr6,r4,0 / bclr` — small comparison helper below the IDA seed floor
+#   (lowest seed 0x82045A70), so no overlap.
+0x82040250 = { }
+# 0x8207A4E0: tail-called by `b 0x8207A4E0` @ 0x8207A628. Preceded by
+#   `8207A4DC: b 0x8207A2B8` (uncond terminator). Body opens
+#   `cmpwi cr6,r4,0 / bclr`; lies in the seed gap 0x82076D90..0x8208F4B0, no overlap.
+0x8207A4E0 = { }

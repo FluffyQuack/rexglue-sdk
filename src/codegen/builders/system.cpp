@@ -49,8 +49,17 @@ bool build_eieio(BuilderContext& ctx) {
 }
 
 bool build_db16cyc(BuilderContext& ctx) {
-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
-  (void)ctx;
+  // Xenon `db16cyc` (encoding 0x7FFFFB78, `or r31,r31,r31`) is the low-priority
+  // SMT thread hint the hardware/compilers emit inside spin-wait loops (lock-free
+  // barriers, spinlocks). On real Xenon it backs the spinning hardware thread off
+  // so a sibling makes progress. Emitting nothing turns these into 100%-CPU tight
+  // loops that NEVER yield -- and because we pin each guest thread 1:1 onto a host
+  // logical core (XThread::SetActiveCpu), a spinning high-priority guest thread can
+  // starve a co-pinned participant forever, deadlocking the guest's own spin
+  // barrier (e.g. EXIT's audio render rendezvous -> permanent silence). Yield the
+  // host scheduler so the awaited thread can run, matching Xenia's db16cyc handling
+  // (DelayExecution / delay_via_maybeyield).
+  ctx.println("\tREX_SPIN_YIELD();");
   return true;
 }
 
@@ -148,12 +157,16 @@ bool build_dcbtst(BuilderContext& ctx) {
 }
 
 bool build_dcbz(BuilderContext& ctx) {
-  // Compute EA, align to 32-byte cache line, apply physical offset
+  // Compute EA, align to 128-byte cache line, apply physical offset.
+  // The Xbox 360 Xenon PPE has 128-byte cache lines, so plain `dcbz` zeroes
+  // 128 bytes (there is no 32-byte form on this target). Modeling it as 32
+  // leaves 96 of every 128 bytes as garbage and silently corrupts any struct a
+  // compiler zero-inits via a dcbz-strided memset. Matches build_dcbzl below.
   ctx.print("\t{} = (", ctx.ea());
   if (ctx.insn.operands[0] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[0]));
-  ctx.println("{}.u32) & ~31;", ctx.r(ctx.insn.operands[1]));
-  ctx.println("\tmemset((void*)REX_RAW_ADDR({}), 0, 32);", ctx.ea());
+  ctx.println("{}.u32) & ~127;", ctx.r(ctx.insn.operands[1]));
+  ctx.println("\tmemset((void*)REX_RAW_ADDR({}), 0, 128);", ctx.ea());
   return true;
 }
 

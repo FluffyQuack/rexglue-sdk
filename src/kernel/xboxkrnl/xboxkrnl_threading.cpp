@@ -14,10 +14,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -37,6 +40,16 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/atomic.h>
 #include <rex/thread/mutex.h>
+
+REXCVAR_DEFINE_UINT32(
+    audio_render_client_global_addr, 0x825A748C, "Audio",
+    "DIAGNOSTIC (default = EXIT2's address): guest address of the XAudio "
+    "render-client GLOBAL POINTER (the word that holds the render-object pointer). "
+    "When nonzero and the audio rendezvous stalls, dump the render object's "
+    "multi-core spin-barrier state (reconfig count, running-thread id, expected-CPU "
+    "slots, check-in words) to pinpoint which expected core never checks in. 0 = "
+    "off. NOTE: cvar ints parse as base-10, so pass this as DECIMAL if overriding "
+    "on the command line (0x825A748C = 2186966156).");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -835,17 +848,175 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
   return result;
 }
 
+namespace {
+
+// If the current thread requested bounded infinite waits (see
+// XThread::set_bounded_infinite_wait_ms) and the guest asked for an INFINITE
+// wait (NULL timeout pointer), substitute a bounded relative timeout. Guest
+// timeouts are signed 100ns ticks; a relative (negative) value of -ms*10000
+// yields `ms` (see XObject::TimeoutTicksToMs). Returns true and fills
+// out_ticks when a clamp should be applied.
+bool MaybeBoundInfiniteWait(bool guest_timeout_present, uint64_t* out_ticks) {
+  if (guest_timeout_present) {
+    return false;  // guest specified its own timeout; leave it alone
+  }
+  auto* thread = XThread::GetCurrentThread();
+  if (!thread) {
+    return false;
+  }
+  const uint32_t ms = thread->bounded_infinite_wait_ms();
+  if (ms == 0) {
+    return false;
+  }
+  *out_ticks = static_cast<uint64_t>(-(static_cast<int64_t>(ms) * 10000));
+  return true;
+}
+
+// One-shot: dump every OTHER thread's native stack. Called the first time the
+// audio rendezvous stalls, to reveal which thread is supposed to signal the
+// resume event and why it isn't (blocked where, or not running at all).
+void DumpAllOtherThreadStacks() {
+  auto* current = XThread::GetCurrentThread();
+  auto threads = REX_KERNEL_OBJECTS()->GetObjectsByType<XThread>();
+  REXKRNL_WARN("---- audio rendezvous stall: dumping {} thread(s) to find the resume signaler ----",
+               threads.size());
+  if (current) {
+    // The caller is the parked render-callback thread; its guest CPU is what the
+    // barrier's expected-core mask is (or isn't) waiting for.
+    REXKRNL_WARN("  (calling render-callback thread '{}' tid {:08X} is on guest CPU {})",
+                 current->name(), current->thread_id(), current->active_cpu());
+  }
+  for (auto& t : threads) {
+    if (!t || t.get() == current) {
+      continue;  // skip self: SuspendThread on the calling thread would hang
+    }
+    auto* host = t->thread();
+    if (!host) {
+      continue;
+    }
+    // The spin barrier (Audio_RenderCoreSpinBarrier) indexes a per-CPU check-in
+    // byte by PCR.prcb_data.current_cpu (r13+0x10C), while active_cpu()/registration
+    // read KTHREAD.current_cpu (+0xBF). If those diverge -- or the guest r13 doesn't
+    // point at this thread's own PCR -- two participants collide on one check-in
+    // byte and the barrier never completes. Log BOTH cpu fields + the PCR pointers.
+    uint8_t kthread_cpu = t->active_cpu();
+    int pcr_cpu = -1;
+    uint32_t pcr_addr = t->pcr_ptr();
+    uint64_t r13 = 0;
+    if (pcr_addr) {
+      pcr_cpu = REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(pcr_addr)->prcb_data.current_cpu;
+    }
+    uint32_t r3 = 0, r4 = 0, r31 = 0;
+    if (auto* ts = t->thread_state()) {
+      auto* c = ts->context();
+      r13 = c->r13.u64;
+      r3 = static_cast<uint32_t>(c->r3.u64);
+      r4 = static_cast<uint32_t>(c->r4.u64);
+      r31 = static_cast<uint32_t>(c->r31.u64);
+    }
+    // r4/r31 expose the EXACT address a barrier-spinning thread checks in to:
+    // the spin uses r4 = check-in word base; the stbx wrote check_in[cpu] at r4+cpu.
+    // If two stuck threads have different r4/r31 (different render_obj or word), they
+    // never rendezvous even with correct CPUs.
+    auto reason = fmt::format(
+        "guest thread '{}' (tid {:08X}{}, KTHREAD.cpu={} PCR.cpu={} pcr_addr={:08X} r13={:08X} "
+        "r3={:08X} r4={:08X} r31={:08X})",
+        host->name(), t->thread_id(), t->is_guest_thread() ? "" : ", host", kthread_cpu, pcr_cpu,
+        pcr_addr, static_cast<uint32_t>(r13), r3, r4, r31);
+    rex::debug::DumpThreadBacktrace(host->native_handle(), reason.c_str());
+  }
+  REXKRNL_WARN("---- end thread dump ----");
+}
+
+// Dump the EXIT audio render object's multi-core spin-barrier bookkeeping so we
+// can see exactly which expected CPU core never checks in. global_ptr_addr is the
+// guest address of the word holding the render-object pointer (cvar
+// audio_render_client_global_addr; EXIT2 = 0x825A748C). Offsets are from the
+// disasm of Audio_RenderCoreSpinBarrier (0x8215B010) / the rendezvous fns.
+void DumpAudioBarrierState(uint32_t global_ptr_addr) {
+  auto* mem = REX_KERNEL_MEMORY();
+  uint32_t obj = memory::load_and_swap<uint32_t>(mem->TranslateVirtual(global_ptr_addr));
+  if (!obj) {
+    REXKRNL_WARN("audio barrier state: render-client global @{:08X} is null", global_ptr_addr);
+    return;
+  }
+  auto rd32 = [&](uint32_t off) {
+    return memory::load_and_swap<uint32_t>(mem->TranslateVirtual(obj + off));
+  };
+  auto rd64 = [&](uint32_t off) {
+    return memory::load_and_swap<uint64_t>(mem->TranslateVirtual(obj + off));
+  };
+  REXKRNL_WARN("audio barrier state: render_obj={:08X} running_thread[+12C]={:08X} "
+               "reconfig_count[+130]={}",
+               obj, rd32(0x12C), rd32(0x130));
+  REXKRNL_WARN("  expected-core slots [+134..+148] (nonzero => CPU expected at barrier): "
+               "cpu0={:08X} cpu1={:08X} cpu2={:08X} cpu3={:08X} cpu4={:08X} cpu5={:08X}",
+               rd32(0x134), rd32(0x138), rd32(0x13C), rd32(0x140), rd32(0x144), rd32(0x148));
+  REXKRNL_WARN("  initiator slots     [+14C..+160] (per-CPU thread ptr): "
+               "cpu0={:08X} cpu1={:08X} cpu2={:08X} cpu3={:08X} cpu4={:08X} cpu5={:08X}",
+               rd32(0x14C), rd32(0x150), rd32(0x154), rd32(0x158), rd32(0x15C), rd32(0x160));
+  REXKRNL_WARN("  check-in words [+164]={:016X} [+16C]={:016X} (1 byte per CPU; must equal the "
+               "expected-CPU pattern to release)",
+               rd64(0x164), rd64(0x16C));
+  // Wider raw window so a check-in byte written to an unexpected offset is visible.
+  for (uint32_t off = 0x160; off < 0x190; off += 0x10) {
+    REXKRNL_WARN("  raw +{:03X}: {:08X} {:08X} {:08X} {:08X}", off, rd32(off), rd32(off + 4),
+                 rd32(off + 8), rd32(off + 0xC));
+  }
+  // Sample the check-in words over ~150ms: FROZEN => true logic/store-visibility stall;
+  // OSCILLATING => barrier-reuse lapping race (a fast worker laps a slow one).
+  for (int i = 0; i < 15; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    REXKRNL_WARN("  sample {:2}: [+164]={:016X} [+16C]={:016X}", i, rd64(0x164), rd64(0x16C));
+  }
+}
+
+// Throttled report when a bounded infinite wait actually expired -- i.e. the
+// guest audio rendezvous stalled and the clamp prevented a permanent dropout.
+void ReportBoundedWaitTimeout(const char* api) {
+  static std::atomic<uint64_t> count{0};
+  const uint64_t n = count.fetch_add(1) + 1;
+  const bool power_of_two = (n & (n - 1)) == 0;
+  if (n <= 8 || power_of_two) {
+    REXKRNL_WARN(
+        "{}: bounded infinite wait on the audio render thread TIMED OUT -- the guest "
+        "audio rendezvous stalled; returning STATUS_TIMEOUT so the callback proceeds "
+        "instead of silencing all audio until restart (total: {}).",
+        api, n);
+  }
+  if (n == 1) {
+    // First-ever stall: one-shot diagnostics so a future audio-rendezvous regression
+    // is debuggable from the log alone. Snapshot every other thread (to see the resume
+    // side)...
+    DumpAllOtherThreadStacks();
+    // ...and the render object's spin-barrier bookkeeping (which CPU is expected but
+    // never checks in). Fall back to EXIT2's render-client global address if the cvar
+    // isn't set, so this works from the rexruntime DLL alone.
+    uint32_t global_addr = REXCVAR_GET(audio_render_client_global_addr);
+    if (!global_addr) {
+      global_addr = 0x825A748Cu;  // EXIT2 render-client global pointer
+    }
+    DumpAudioBarrierState(global_addr);
+  }
+}
+
+}  // namespace
+
 u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
                                 u32 alertable, mapped_u64 timeout_ptr) {
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-  // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
-  // timeout={}",
-  // object_ptr.guest_address(), (uint32_t)wait_reason,
-  //(uint32_t)processor_mode, (uint32_t)alertable,
-  // timeout_ptr ? (int64_t)timeout : -1);
+  bool has_timeout = static_cast<bool>(timeout_ptr);
+  uint64_t bound_ticks;
+  const bool bounded = MaybeBoundInfiniteWait(has_timeout, &bound_ticks);
+  if (bounded) {
+    timeout = bound_ticks;
+    has_timeout = true;
+  }
   auto result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
-                                        timeout_ptr ? &timeout : nullptr);
-  // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
+                                        has_timeout ? &timeout : nullptr);
+  if (bounded && result == X_STATUS_TIMEOUT) {
+    ReportBoundedWaitTimeout("KeWaitForSingleObject");
+  }
   return result;
 }
 
@@ -884,9 +1055,19 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
   }
 
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+  bool has_timeout = static_cast<bool>(timeout_ptr);
+  uint64_t bound_ticks;
+  const bool bounded = MaybeBoundInfiniteWait(has_timeout, &bound_ticks);
+  if (bounded) {
+    timeout = bound_ticks;
+    has_timeout = true;
+  }
   X_STATUS result = XObject::WaitMultiple(
       uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
-      processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
+      processor_mode, alertable, has_timeout ? &timeout : nullptr);
+  if (bounded && result == X_STATUS_TIMEOUT) {
+    ReportBoundedWaitTimeout("KeWaitForMultipleObjects");
+  }
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
   }

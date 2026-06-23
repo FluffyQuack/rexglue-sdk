@@ -41,6 +41,14 @@ void DebugPrint(fmt::string_view format, const Args&... args) {
   detail::DebugPrint(fmt::vformat(format, fmt::make_format_args(args...)).c_str());
 }
 
+// Suspends the given native thread, walks and symbolizes its call stack to the
+// log (one WARN line per frame, prefixed by `reason`), then resumes it. Intended
+// for catching a thread that is wedged inside a never-returning call from a
+// monitor running on another thread. `native_thread_handle` is the OS thread
+// handle (rex::thread::Thread::native_handle()); passing the calling thread's own
+// handle is undefined. No-op (logs nothing) on platforms without support.
+void DumpThreadBacktrace(void* native_thread_handle, const char* reason);
+
 }  // namespace rex::debug
 
 #ifdef REXGLUE_ENABLE_PROFILING

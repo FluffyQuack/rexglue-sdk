@@ -330,6 +330,17 @@ class XThread : public XObject {
   void set_last_error(uint32_t error_code);
   void set_name(const std::string_view name);
 
+  // When nonzero, infinite (NULL-timeout) guest waits issued on THIS thread are
+  // clamped to this many ms (returning STATUS_TIMEOUT on expiry). The audio
+  // system sets this around the guest render callback, which it runs inline on
+  // its worker thread: that callback can do a cross-thread KeWaitForMultipleObjects
+  // rendezvous with the game's mixer thread, and if that rendezvous ever stalls
+  // an unbounded wait wedges the audio worker and silences ALL output until
+  // restart. Clamping degrades a stalled rendezvous to a skipped frame. Only
+  // read/written on the owning thread, so no synchronization is required.
+  void set_bounded_infinite_wait_ms(uint32_t ms) { bounded_infinite_wait_ms_ = ms; }
+  uint32_t bounded_infinite_wait_ms() const { return bounded_infinite_wait_ms_; }
+
   X_STATUS Create();
   X_STATUS Exit(int exit_code);
   X_STATUS Terminate(int exit_code);
@@ -412,6 +423,7 @@ class XThread : public XObject {
   bool guest_thread_ = false;
   bool main_thread_ = false;  // Entry-point thread
   bool running_ = false;
+  uint32_t bounded_infinite_wait_ms_ = 0;  // see set_bounded_infinite_wait_ms()
 
   std::string thread_name_;
   std::unique_ptr<runtime::ThreadState> thread_state_;

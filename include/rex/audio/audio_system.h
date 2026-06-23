@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <queue>
+#include <thread>
 
 #include <rex/kernel.h>
 #include <rex/memory.h>
@@ -62,6 +63,15 @@ class AudioSystem : public system::IAudioSystem {
 
   void WorkerThreadMain();
 
+  // Watchdog: the single worker thread runs guest audio callbacks inline, so a
+  // guest callback that blocks forever (a guest wait/lock/spin that never
+  // completes) wedges ALL audio with no log output -- the worker never returns
+  // to its wait loop to time out. This host-side monitor detects that (a
+  // callback in flight too long, or the worker loop not advancing while neither
+  // in a callback nor paused) and dumps the worker's native stack so the
+  // offending guest function can be identified and named.
+  void WatchdogThreadMain();
+
   virtual X_STATUS CreateDriver(size_t index, rex::thread::Semaphore* semaphore,
                                 AudioDriver** out_driver) = 0;
   virtual void DestroyDriver(AudioDriver* driver) = 0;
@@ -75,6 +85,15 @@ class AudioSystem : public system::IAudioSystem {
 
   std::atomic<bool> worker_running_ = {false};
   system::object_ref<system::XHostThread> worker_thread_;
+
+  // Watchdog state (see WatchdogThreadMain). All cross-thread, so atomic.
+  std::thread watchdog_thread_;
+  std::atomic<bool> watchdog_running_ = {false};
+  std::atomic<void*> worker_native_handle_ = {nullptr};
+  std::atomic<uint32_t> cb_active_callback_ = {0};  // guest addr of in-flight callback, 0 = none
+  std::atomic<int64_t> cb_active_since_ms_ = {0};   // steady-clock ms when it started
+  std::atomic<uint64_t> cb_generation_ = {0};       // bumped per dispatch (dedupes dumps)
+  std::atomic<uint64_t> worker_heartbeat_ = {0};    // bumped each worker loop iteration
 
   rex::thread::global_critical_region global_critical_region_;
   static const size_t kMaximumClientCount = 8;
@@ -93,7 +112,7 @@ class AudioSystem : public system::IAudioSystem {
   std::unique_ptr<rex::thread::Event> shutdown_event_;
   rex::thread::WaitHandle* wait_handles_[kMaximumClientCount + 1];
 
-  bool paused_ = false;
+  std::atomic<bool> paused_ = {false};
   rex::thread::Fence pause_fence_;
   std::unique_ptr<rex::thread::Event> resume_event_;
 };

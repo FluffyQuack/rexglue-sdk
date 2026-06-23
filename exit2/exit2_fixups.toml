@@ -1,0 +1,10 @@
+# EXIT 2 — hand-authored boundary fixups (Phase 8 codegen loop onward).
+#
+# Included from exit2_manifest.toml ([entrypoint].includes), kept SEPARATE from
+# exit2_config.toml so the IDA boundary seed there can be regenerated in
+# overwrite mode without clobbering these comments. Everything here is resolved
+# structurally against Assets/EXIT2/default.disasm.txt; no sizes are guessed.
+# Every entry must explain the exact terminator (b / bctr / blr) that fixes its
+# boundary. Empty until the first UnresolvedCall / indirect-call trap.
+
+[functions]

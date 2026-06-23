@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 
 #include <rex/kernel.h>
@@ -216,10 +217,20 @@ class XmaContext {
       work_completion_event_->Set();
     }
   }
-  void WaitForWorkDone() {
-    if (work_completion_event_) {
-      rex::thread::Wait(work_completion_event_.get(), false);
+  // Wait for the decoder worker to signal that it finished a kicked decode.
+  // Returns true if completion was signaled, false if the timeout elapsed
+  // first. The wait MUST be bounded: this is called on the guest thread that
+  // issued the XMA kick, and that thread is frequently the audio worker running
+  // the periodic client callback. If the worker ever fails to signal (a missed
+  // auto-reset event, a context disabled mid-kick, or an FFmpeg stall), an
+  // unbounded wait here would block that thread forever -- which drains the
+  // audio queue and silences ALL output permanently until the app restarts.
+  bool WaitForWorkDone(std::chrono::milliseconds timeout) {
+    if (!work_completion_event_) {
+      return true;
     }
+    return rex::thread::Wait(work_completion_event_.get(), false, timeout) ==
+           rex::thread::WaitResult::kSuccess;
   }
 
  private:
