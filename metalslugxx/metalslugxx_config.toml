@@ -5,7 +5,7 @@
 # (immutable, exact-boundary) functions in the graph.
 #
 # ---------------------------------------------------------------------------
-# Phase C, pass 1 (2026-06-13): resolve the 8 UnresolvedCall errors from the
+# Phase C, pass 1: resolve the 8 UnresolvedCall errors from the
 # first codegen run. All 8 were `b <target>` (tail-call) instructions whose
 # target the auto-scanner never placed in a function. Two root causes, both
 # fixed by declaring explicit function boundaries:
@@ -82,8 +82,41 @@
 "0x823E7310" = { name = "ms_present_playfield_upscale" }         # draws the final intermediate quad to the 1280x720 frame
 "0x823E7830" = { name = "ms_ensure_playfield_upscale_targets" }  # lazy init for the playfield upscale targets
 
+# Sound / XACT path (RE'd 2026-06-17 from the XAudio imports and XACT bank/cue
+# object flow used by media\sounds\*.xgs/*.xsb/*.xwb). The game wraps a bundled
+# XACT runtime: manager methods create wave/sound banks, allocate active cue
+# objects, update per-cue parameters, and feed the XAudio render client.
+"0x827D3DD8" = { name = "ms_xact_sound_manager_ctor" }              # constructs the XACT-backed sound manager; list heads, cue pools, and state fields
+"0x827D38C0" = { name = "ms_xact_sound_manager_initialize" }        # initializes engine state, creates bank objects, and prepares the active-cue pool
+"0x827D0AE8" = { name = "ms_xact_create_bank_from_memory" }         # creates a XACT bank object from a loaded buffer and stores the returned interface
+"0x827D3BA0" = { name = "ms_xact_get_or_create_bank_entry" }        # finds/allocates a bank entry keyed by bank id; wires wave/sound bank handles
+"0x827D3118" = { name = "ms_xact_create_playing_cue" }              # validates cue metadata, allocates a playing-cue object, and returns its handle
+"0x827D33E8" = { name = "ms_xact_on_playing_cue_destroyed" }        # removes a cue object from the manager's active/reference lists on final release
+"0x827D0BC8" = { name = "ms_xact_sound_manager_update" }            # polls XAudio voice-category volume, refreshes active cues, then advances XACT work
+"0x827D7790" = { name = "ms_xact_cue_set_volume" }                  # updates a cue volume scalar and pushes it to the underlying XACT instance
+"0x827D7848" = { name = "ms_xact_cue_set_variable_by_name" }        # updates a named XACT variable/RPC value on an active cue
+"0x827D7930" = { name = "ms_xact_cue_play" }                        # starts/resumes an active cue and updates manager active-sample accounting
+"0x827D7A98" = { name = "ms_xact_cue_stop" }                        # stops an active cue, propagating stop flags through child wave/cue objects
+"0x827D8448" = { name = "ms_xact_cue_refresh_category_volume" }     # reapplies system voice-category volume to an active cue when XAudio volume changes
+"0x82801F40" = { name = "ms_xaudio_register_render_client" }        # queries speaker config and registers the XAudio render-driver client callback
+"0x82801AF8" = { name = "ms_xaudio_submit_render_frames" }          # render callback; submits 256 frames of six-float audio data to XAudio
+"0x82801BE8" = { name = "ms_xaudio_unregister_render_client" }      # signals shutdown and unregisters the XAudio render-driver client
+"0x82801D68" = { name = "ms_xaudio_render_client_ctor" }            # initializes render-client state, event handles, counters, and frame buffers
+
+# Sound event and cue dispatch. Event 99 resolves to ARC_SE cue index 41,
+# which is the XACT cue name "arcse041" used by the laser gun sound effect.
+"0x823E4DB0" = { name = "ms_sound_resolve_bank_cue_name" }          # Bank id + cue index to XACT cue-name pointer; bank 1, cue 41 resolves to ARC_SE arcse041
+"0x823DF1C8" = { name = "ms_sound_resolve_packed_cue_name" }        # Unpack (bank << 12) | cue and resolve the XACT cue name
+"0x8256C8E0" = { name = "ms_sound_play_bank_cue_in_slot" }          # Resolve a bank/cue, obtain the XACT cue, track it in a playback slot, and start it
+"0x821F4620" = { name = "ms_sound_play_arcse_group_cue" }           # Sound-table wrapper; group 0 routes through ARC_SE, so cue 41 plays arcse041
+"0x82205AE8" = { name = "ms_sound_enqueue_event" }                  # Queue a sound event record from 0x82BD1700; events 42 and 99 both point at ARC_SE cue 41
+"0x822056A8" = { name = "ms_sound_update_event_queue" }             # Drain queued sound events and dispatch record bytes +2/+3 to ms_sound_play_arcse_group_cue
+"0x82205D30" = { name = "ms_sound_stop_event" }                     # Remove/stop an active sound event by event id
+"0x82334AF0" = { name = "ms_laser_sound_start" }                    # Set the object's laser-sound bit, increment the active laser count, and enqueue event 99
+"0x82334B30" = { name = "ms_laser_sound_stop" }                     # Clear the laser-sound bit and stop event 99 when the last active laser releases it
+
 # ---------------------------------------------------------------------------
-# Phase D, pass 1 (2026-06-13): resolve compile errors of the form
+# Phase D, pass 1: resolve compile errors of the form
 # "use of undeclared label 'loc_XXXX'" in the generated recomp TUs. Root cause:
 # two real, independently-called functions OVERLAP and share a common tail
 # (epilogue / out-of-line case bodies). Auto-discovery bounded the lower-address
@@ -109,7 +142,7 @@
 "0x822CC4C0" = { size = 0x34, name = "ms_mission5_stream_dispatch_cont" }
 
 # ---------------------------------------------------------------------------
-# Phase E, run 3 fix (2026-06-14): resolve W1. After Run 2 (callback recovery)
+# Phase E, run 3 fix: resolve W1. After Run 2 (callback recovery)
 # the boot got through both logos and trapped at a *stable* W1 guard —
 # "[FATAL] Unresolved call from 0x8242AC30 to 0x8242D230" (logs 006/007). The
 # Phase C note speculated W1 might be a runtime-materialized fragment needing a
@@ -127,7 +160,7 @@
 # Body ends at the tail `b 0x82B3B1CC` (0x8242D638); next real fn is 0x8242D640
 # after one .long 0 pad, so size = 0x8242D63C - 0x8242D230 = 0x40C.
 #
-# Run 5 update (2026-06-14): the W1 size hint was correct and necessary, but it
+# Run 5 update: the W1 size hint was correct and necessary, but it
 # only made the trampoline branch *resolve* — the recompiled ctx_swap body is
 # itself unsound (see the [rexcrt] section below). This entry is RETAINED because
 # the [rexcrt] redirect needs a graph node at 0x8242D230 to rename+exclude (the
@@ -136,7 +169,7 @@
 "0x8242D230" = { size = 0x40C, name = "ctx_swap_8242D230" }   # fiber/coroutine context switch (W1; redirected via [rexcrt])
 
 # ---------------------------------------------------------------------------
-# Phase E, run 5 fix (2026-06-14): the post-logo SILENT native crash.
+# Phase E, run 5 fix: the post-logo SILENT native crash.
 #
 # Run 4 added a symbolizing crash handler; Run 5 produced the backtrace
 # (logs/metalslugxx_009.log):
@@ -188,7 +221,7 @@ DeleteFiber          = 0x8242ABD0
 SwitchToFiber        = 0x8242D230
 
 # ---------------------------------------------------------------------------
-# W2/W3 resolved 2026-06-16. The old jump-table hypothesis for
+# W2/W3 resolved. The old jump-table hypothesis for
 # 0x826A0A28/0x827DEEF4 was disproven by disassembly; both targets are shared
 # return fragments now registered in [functions] above.
 # ---------------------------------------------------------------------------
@@ -1795,8 +1828,8 @@ SwitchToFiber        = 0x8242D230
 0x82334C48 = { size = 0x5C }
 0x82334D70 = { size = 0x9C }
 0x82334E28 = { size = 0x70 }
-0x82334E98 = { size = 0xA4 }
-0x82334F40 = { size = 0xC0 }
+0x82334E98 = { size = 0xA4, name = "ms_laser_start_state_and_sound" }      # Starts/references event 99 before entering the active laser update state
+0x82334F40 = { size = 0xC0, name = "ms_laser_stop_sound_and_transition" }  # Releases event 99 and advances the laser object's state
 0x82335000 = { size = 0x70 }
 0x823352B0 = { size = 0x5C }
 0x82335310 = { size = 0x5C }
@@ -4288,7 +4321,7 @@ SwitchToFiber        = 0x8242D230
 0x82BC39A0 = { size = 0x108 }
 
 # ---------------------------------------------------------------------------
-# Mission 5 stream dispatcher crash (2026-06-16).
+# Mission 5 stream dispatcher crash.
 #
 # The table at 0x82014FF4 has five valid entries. Auto-detection previously
 # truncated the local bctr sites in sub_822CC498 to cases 0 and 1; after those

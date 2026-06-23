@@ -15,6 +15,7 @@
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/memory/ring_buffer.h>
@@ -32,6 +33,10 @@ extern "C" {
 #pragma warning(pop)
 #endif
 }  // extern "C"
+
+REXCVAR_DEFINE_BOOL(
+    xma_loop_diagnostics, false, "Audio/XMA",
+    "Log low-volume generic XMA loop scheduler transitions");
 
 // Credits for most of this code goes to:
 // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
@@ -112,7 +117,7 @@ bool XmaContext::Work() {
 
   // Consume-only context: no input, just drain remaining subframes.
   if (data.IsConsumeOnlyContext()) {
-    if (current_frame_remaining_subframes_ == 0) {
+    if (!current_frame_window_pending_) {
       return true;
     }
     Consume(&output_rb, &data);
@@ -121,22 +126,40 @@ bool XmaContext::Work() {
     return true;
   }
 
-  // Minimum free blocks needed before attempting a decode.
-  // Use subframe_decode_count (clamped to 1) instead of full frame size.
-  const uint32_t effective_sdc = std::max(static_cast<uint32_t>(1), data.subframe_decode_count);
-  const int32_t minimum_subframe_decode_count =
-      static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
-
-  if (minimum_subframe_decode_count > remaining_subframe_blocks_in_output_buffer_) {
+  if (remaining_subframe_blocks_in_output_buffer_ <=
+      static_cast<int32_t>(data.output_buffer_padding)) {
     StoreContextMerged(data, initial_data, context_ptr);
     return true;
   }
 
-  while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+  while (remaining_subframe_blocks_in_output_buffer_ >
+         static_cast<int32_t>(data.output_buffer_padding)) {
+    const uint32_t previous_read_offset = data.input_buffer_read_offset;
+    const uint8_t previous_current_buffer = data.current_buffer;
+    const bool previous_buffer_0_valid = data.input_buffer_0_valid != 0;
+    const bool previous_buffer_1_valid = data.input_buffer_1_valid != 0;
+    const bool previous_window_pending = current_frame_window_pending_;
+    const uint32_t previous_output_byte = current_frame_output_byte_;
+    const uint32_t previous_partial_output_bytes =
+        partial_output_block_bytes_;
+
     Decode(&data);
-    Consume(&output_rb, &data);
+    const bool consumed = Consume(&output_rb, &data);
 
     if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+      break;
+    }
+
+    const bool decoder_progressed =
+        consumed ||
+        previous_read_offset != data.input_buffer_read_offset ||
+        previous_current_buffer != data.current_buffer ||
+        previous_buffer_0_valid != (data.input_buffer_0_valid != 0) ||
+        previous_buffer_1_valid != (data.input_buffer_1_valid != 0) ||
+        previous_window_pending != current_frame_window_pending_ ||
+        previous_output_byte != current_frame_output_byte_ ||
+        previous_partial_output_bytes != partial_output_block_bytes_;
+    if (!decoder_progressed) {
       break;
     }
   }
@@ -186,9 +209,7 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
   data->output_buffer_read_offset = 0;
   data->output_buffer_write_offset = 0;
 
-  current_frame_remaining_subframes_ = 0;
-  loop_frame_output_limit_ = 0;
-  loop_start_skip_pending_ = false;
+  ResetStreamState();
 }
 
 void XmaContext::Disable() {
@@ -200,8 +221,9 @@ void XmaContext::Release() {
   std::lock_guard<std::mutex> lock(lock_);
   assert_true(is_allocated());
 
-  set_is_allocated(false);
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+  set_is_allocated(false);
+  ResetStreamState();
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
 }
 
@@ -215,24 +237,31 @@ void XmaContext::SwapInputBuffer(XMA_CONTEXT_DATA* data) {
   data->input_buffer_read_offset = kBitsPerPacketHeader;
 }
 
-void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
-  if (data->loop_count == 0) {
-    return;
+void XmaContext::ResetStreamState() {
+  // Setup allocates the codec context before the title creates or initializes
+  // any XMA stream. Clear may therefore arrive while FFmpeg has a codec
+  // pointer but no AVCodecInternal yet; avcodec_flush_buffers requires an
+  // opened context.
+  const bool codec_open = av_context_ && avcodec_is_open(av_context_);
+  if (codec_open) {
+    avcodec_flush_buffers(av_context_);
   }
-
-  const uint32_t loop_start = std::max(kBitsPerPacketHeader, data->loop_start);
-  const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
-
-  if (data->input_buffer_read_offset != loop_end) {
-    return;
-  }
-
-  data->input_buffer_read_offset = loop_start;
-  loop_start_skip_pending_ = true;
-
-  if (data->loop_count < 255) {
-    data->loop_count--;
-  }
+  current_frame_window_ = {};
+  current_frame_output_byte_ = 0;
+  current_frame_output_end_byte_ = 0;
+  current_frame_window_pending_ = false;
+  current_frame_physical_eof_ = false;
+  logical_frame_.fill(0);
+  partial_output_block_.fill(0);
+  partial_output_block_bytes_ = 0;
+  pending_frame_advance_ = {};
+  logical_loop_cache_.Reset();
+  logical_loop_cache_frame_advance_ = {};
+  decoded_stream_state_.Reset();
+  loop_scheduler_.Reset();
+  loop_input_buffer_address_ = 0;
+  loop_diagnostic_event_count_ = 0;
+  decoder_needs_flush_ = false;
 }
 
 int XmaContext::GetSampleRate(int id) {
@@ -401,50 +430,213 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
   fresh.Store(context_ptr);
 }
 
-void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data) {
-  if (!current_frame_remaining_subframes_) {
+void XmaContext::WriteOutputPcm(memory::RingBuffer* output_rb,
+                                const uint8_t* pcm, size_t byte_count) {
+  assert_zero(byte_count % kOutputBytesPerBlock);
+  output_rb->Write(pcm, byte_count);
+}
+
+bool XmaContext::Consume(memory::RingBuffer* output_rb, XMA_CONTEXT_DATA* data) {
+  if (!current_frame_window_pending_) {
+    return false;
+  }
+
+  const uint32_t effective_sdc =
+      std::max(static_cast<uint32_t>(1), data->subframe_decode_count);
+  const int32_t available_blocks =
+      std::max(remaining_subframe_blocks_in_output_buffer_, 0);
+  int32_t block_budget =
+      std::min(static_cast<int32_t>(effective_sdc), available_blocks);
+
+  const uint32_t remaining_frame_bytes =
+      current_frame_output_end_byte_ - current_frame_output_byte_;
+  const uint32_t pending_bytes =
+      partial_output_block_bytes_ + remaining_frame_bytes;
+  uint32_t blocks_needed_to_finish =
+      pending_bytes / kOutputBytesPerBlock;
+  if (current_frame_physical_eof_ &&
+      pending_bytes % kOutputBytesPerBlock != 0) {
+    ++blocks_needed_to_finish;
+  }
+  if (blocks_needed_to_finish <= static_cast<uint32_t>(block_budget) &&
+      available_blocks <
+          static_cast<int32_t>(blocks_needed_to_finish +
+                               data->output_buffer_padding)) {
+    block_budget =
+        std::max(available_blocks -
+                     static_cast<int32_t>(data->output_buffer_padding),
+                 0);
+  }
+
+  bool progressed = false;
+  const auto write_blocks = [&](const uint8_t* pcm, uint32_t block_count) {
+    WriteOutputPcm(output_rb, pcm,
+                   static_cast<size_t>(block_count) *
+                       kOutputBytesPerBlock);
+    remaining_subframe_blocks_in_output_buffer_ -= block_count;
+    block_budget -= block_count;
+  };
+
+  if (partial_output_block_bytes_ == kOutputBytesPerBlock) {
+    if (block_budget == 0) {
+      return false;
+    }
+    write_blocks(partial_output_block_.data(), 1);
+    partial_output_block_bytes_ = 0;
+    progressed = true;
+  }
+
+  while (current_frame_output_byte_ < current_frame_output_end_byte_) {
+    const uint32_t frame_bytes_left =
+        current_frame_output_end_byte_ - current_frame_output_byte_;
+
+    if (partial_output_block_bytes_ != 0) {
+      const uint32_t copy_count =
+          std::min(kOutputBytesPerBlock - partial_output_block_bytes_,
+                   frame_bytes_left);
+      std::memcpy(
+          partial_output_block_.data() + partial_output_block_bytes_,
+          logical_frame_.data() + current_frame_output_byte_, copy_count);
+      partial_output_block_bytes_ += copy_count;
+      current_frame_output_byte_ += copy_count;
+      progressed = true;
+
+      if (partial_output_block_bytes_ == kOutputBytesPerBlock) {
+        if (block_budget == 0) {
+          return true;
+        }
+        write_blocks(partial_output_block_.data(), 1);
+        partial_output_block_bytes_ = 0;
+      }
+      continue;
+    }
+
+    const uint32_t full_blocks = frame_bytes_left / kOutputBytesPerBlock;
+    if (full_blocks != 0 && block_budget != 0) {
+      const uint32_t blocks_to_write =
+          std::min(full_blocks, static_cast<uint32_t>(block_budget));
+      write_blocks(logical_frame_.data() + current_frame_output_byte_,
+                   blocks_to_write);
+      current_frame_output_byte_ +=
+          blocks_to_write * kOutputBytesPerBlock;
+      progressed = true;
+      continue;
+    }
+
+    if (frame_bytes_left < kOutputBytesPerBlock) {
+      std::memcpy(partial_output_block_.data(),
+                  logical_frame_.data() + current_frame_output_byte_,
+                  frame_bytes_left);
+      partial_output_block_bytes_ = frame_bytes_left;
+      current_frame_output_byte_ = current_frame_output_end_byte_;
+      progressed = true;
+    }
+    break;
+  }
+
+  if (current_frame_output_byte_ == current_frame_output_end_byte_) {
+    if (current_frame_physical_eof_ &&
+        partial_output_block_bytes_ != 0) {
+      if (partial_output_block_bytes_ < kOutputBytesPerBlock) {
+        std::fill(partial_output_block_.begin() +
+                      partial_output_block_bytes_,
+                  partial_output_block_.end(), 0);
+        partial_output_block_bytes_ = kOutputBytesPerBlock;
+        progressed = true;
+      }
+      if (block_budget == 0) {
+        return progressed;
+      }
+      write_blocks(partial_output_block_.data(), 1);
+      partial_output_block_bytes_ = 0;
+    }
+
+    remaining_subframe_blocks_in_output_buffer_ -=
+        data->output_buffer_padding;
+    CompleteFrameWindow(data);
+    progressed = true;
+  }
+  return progressed;
+}
+
+void XmaContext::AdvanceInputAfterFrame(XMA_CONTEXT_DATA* data) {
+  const PendingFrameAdvance advance = pending_frame_advance_;
+  pending_frame_advance_ = {};
+  if (!advance.valid) {
     return;
   }
 
-  if (loop_frame_output_limit_ > 0) {
-    const uint8_t total_subframes = (kBytesPerFrameChannel / kOutputBytesPerBlock)
-                                    << data->is_stereo;
-    const uint8_t consumed = total_subframes - current_frame_remaining_subframes_;
-    if (consumed >= loop_frame_output_limit_) {
-      remaining_subframe_blocks_in_output_buffer_ -= data->output_buffer_padding;
-      current_frame_remaining_subframes_ = 0;
-      loop_frame_output_limit_ = 0;
-      return;
-    }
+  if (!advance.swap_input_buffer) {
+    data->input_buffer_read_offset = advance.next_input_offset;
+    return;
   }
 
-  const uint8_t effective_sdc = std::max(static_cast<uint32_t>(1), data->subframe_decode_count);
-  int8_t subframes_to_write = std::min(static_cast<int8_t>(current_frame_remaining_subframes_),
-                                       static_cast<int8_t>(effective_sdc));
-
-  if (loop_frame_output_limit_ > 0) {
-    const uint8_t total_subframes = (kBytesPerFrameChannel / kOutputBytesPerBlock)
-                                    << data->is_stereo;
-    const uint8_t consumed = total_subframes - current_frame_remaining_subframes_;
-    const int8_t remaining_until_limit = static_cast<int8_t>(loop_frame_output_limit_ - consumed);
-    if (subframes_to_write > remaining_until_limit) {
-      subframes_to_write = remaining_until_limit;
-    }
+  SwapInputBuffer(data);
+  if (!data->IsAnyInputBufferValid()) {
+    return;
   }
 
-  const int8_t raw_frame_read_offset =
-      ((kBytesPerFrameChannel / kOutputBytesPerBlock) << data->is_stereo) -
-      current_frame_remaining_subframes_;
+  const uint8_t* next_input_buffer =
+      memory()->TranslatePhysical(data->GetCurrentInputBufferAddress());
+  const uint32_t next_input_offset =
+      xma::GetPacketFrameOffset(next_input_buffer);
+  if (next_input_offset > kMaxFrameSizeinBits) {
+    SwapInputBuffer(data);
+    return;
+  }
+  data->input_buffer_read_offset = next_input_offset;
+}
 
-  output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
-                   subframes_to_write * kOutputBytesPerBlock);
+void XmaContext::CompleteFrameWindow(XMA_CONTEXT_DATA* data) {
+  const xma::LoopFrameConfig loop_config = {
+      .loop_start_frame =
+          std::max(kBitsPerPacketHeader, data->loop_start),
+      .loop_end_frame = std::max(kBitsPerPacketHeader, data->loop_end),
+      .loop_subframe_start =
+          static_cast<uint8_t>(data->loop_subframe_start),
+      .loop_subframe_end =
+          static_cast<uint8_t>(data->loop_subframe_end),
+      .loop_subframe_skip =
+          static_cast<uint8_t>(data->loop_subframe_skip),
+      .loop_count = static_cast<uint8_t>(data->loop_count),
+  };
+  const xma::LoopFrameCompletion completion =
+      loop_scheduler_.CompleteFrame(loop_config);
 
-  const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
-                              ? data->output_buffer_padding
-                              : 0;
+  current_frame_window_ = {};
+  current_frame_output_byte_ = 0;
+  current_frame_output_end_byte_ = 0;
+  current_frame_window_pending_ = false;
+  current_frame_physical_eof_ = false;
 
-  remaining_subframe_blocks_in_output_buffer_ -= subframes_to_write + headroom;
-  current_frame_remaining_subframes_ -= subframes_to_write;
+  if (completion.decrement_loop_count && data->loop_count > 0 &&
+      data->loop_count < xma::kInfiniteLoopCount) {
+    --data->loop_count;
+  }
+
+  if (completion.rewind_to_loop_start) {
+    data->input_buffer_read_offset = loop_config.loop_start_frame;
+    pending_frame_advance_ = {};
+  } else {
+    AdvanceInputAfterFrame(data);
+  }
+
+  if (REXCVAR_GET(xma_loop_diagnostics) &&
+      (completion.rewind_to_loop_start ||
+       completion.decrement_loop_count)) {
+    const uint32_t event_number = ++loop_diagnostic_event_count_;
+    if (event_number <= 8 ||
+        (event_number & (event_number - 1)) == 0) {
+      REXAPU_INFO(
+          "XmaContext {} loop event {}: rewind={} decrement={} "
+          "iteration_active={} loop_count={} read_offset={}",
+          id(), event_number, completion.rewind_to_loop_start,
+          completion.decrement_loop_count,
+          loop_scheduler_.loop_iteration_active(),
+          static_cast<uint32_t>(data->loop_count),
+          static_cast<uint32_t>(data->input_buffer_read_offset));
+    }
+  }
 }
 
 int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
@@ -466,7 +658,12 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
       REXAPU_ERROR("XmaContext: Failed to reopen FFmpeg context");
       return -1;
     }
+    decoder_needs_flush_ = false;
     return 1;
+  }
+  if (decoder_needs_flush_) {
+    avcodec_flush_buffers(av_context_);
+    decoder_needs_flush_ = false;
   }
   return 0;
 }
@@ -504,6 +701,22 @@ bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_pac
   return true;
 }
 
+bool XmaContext::DecodeFinalOverlap(AVCodecContext* av_context,
+                                    AVFrame* av_frame) {
+  auto ret = avcodec_send_packet(av_context, nullptr);
+  if (ret < 0) {
+    return false;
+  }
+  decoder_needs_flush_ = true;
+
+  ret = avcodec_receive_frame(av_context, av_frame);
+  if (ret < 0) {
+    return false;
+  }
+  return av_frame->nb_samples >=
+         static_cast<int>(kSamplesPerSubframe);
+}
+
 void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   SCOPE_profile_cpu_f("apu");
 
@@ -511,7 +724,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     return;
   }
 
-  if (current_frame_remaining_subframes_ > 0) {
+  if (current_frame_window_pending_) {
     return;
   }
 
@@ -522,18 +735,89 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     }
   }
 
+  const uint32_t current_input_buffer_address =
+      data->GetCurrentInputBufferAddress();
+  if (decoded_stream_state_.physical_eof_seen() &&
+      !loop_scheduler_.loop_iteration_active()) {
+    // A new valid input after a completed non-looping stream is a fresh
+    // activation even if the guest reuses the same XMA context.
+    decoded_stream_state_.Reset();
+  }
+  if (loop_input_buffer_address_ != 0 &&
+      loop_input_buffer_address_ != current_input_buffer_address &&
+      loop_scheduler_.loop_start_saved()) {
+    // A loop rewind is relative to its original input block. Replacing that
+    // block starts a new stream and makes its intro eligible again.
+    loop_scheduler_.Reset();
+    logical_loop_cache_.Reset();
+    logical_loop_cache_frame_advance_ = {};
+    loop_input_buffer_address_ = 0;
+    loop_diagnostic_event_count_ = 0;
+  }
+
+  const xma::LoopFrameConfig loop_config = {
+      .loop_start_frame =
+          std::max(kBitsPerPacketHeader, data->loop_start),
+      .loop_end_frame =
+          std::max(kBitsPerPacketHeader, data->loop_end),
+      .loop_subframe_start =
+          static_cast<uint8_t>(data->loop_subframe_start),
+      .loop_subframe_end =
+          static_cast<uint8_t>(data->loop_subframe_end),
+      .loop_subframe_skip =
+          static_cast<uint8_t>(data->loop_subframe_skip),
+      .loop_count = static_cast<uint8_t>(data->loop_count),
+  };
+  const bool is_same_frame_loop =
+      data->loop_count != 0 &&
+      loop_config.loop_start_frame == data->input_buffer_read_offset &&
+      loop_config.loop_end_frame == data->input_buffer_read_offset;
+  if (is_same_frame_loop && loop_scheduler_.loop_iteration_active() &&
+      logical_loop_cache_.valid()) {
+    const uint8_t repeated_begin_subframe =
+        std::min(loop_config.loop_subframe_skip,
+                 xma::kSubframesPerFrame);
+    const uint8_t repeated_end_subframe =
+        std::max<uint8_t>(
+            repeated_begin_subframe,
+            loop_config.loop_subframe_end == 0
+                ? xma::kSubframesPerFrame
+                : std::min(loop_config.loop_subframe_end,
+                           xma::kSubframesPerFrame));
+    const xma::LogicalLoopCacheKey cache_key = {
+        .input_buffer_address = current_input_buffer_address,
+        .frame_offset = data->input_buffer_read_offset,
+        .begin_subframe = repeated_begin_subframe,
+        .end_subframe = repeated_end_subframe,
+        .sample_rate = static_cast<uint8_t>(data->sample_rate),
+        .is_stereo = bool(data->is_stereo),
+    };
+    if (logical_loop_cache_.Matches(cache_key)) {
+      const xma::LoopFrameSchedule schedule =
+          loop_scheduler_.ScheduleFrame(data->input_buffer_read_offset,
+                                        loop_config);
+      logical_frame_.fill(0);
+      std::memcpy(logical_frame_.data(), logical_loop_cache_.data(),
+                  logical_loop_cache_.byte_count());
+      current_frame_window_ = schedule.window;
+      current_frame_output_byte_ = 0;
+      current_frame_output_end_byte_ =
+          static_cast<uint32_t>(logical_loop_cache_.byte_count());
+      current_frame_window_pending_ = true;
+      // Preserve partial output between cached traversals, but pad the final
+      // partial block when a finite loop reaches its physical stream end.
+      current_frame_physical_eof_ =
+          data->loop_count == 1;
+      pending_frame_advance_ = logical_loop_cache_frame_advance_;
+      return;
+    }
+
+    logical_loop_cache_.Reset();
+    logical_loop_cache_frame_advance_ = {};
+  }
   uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
 
   input_buffer_.fill(0);
-
-  // Detect loop end frame before UpdateLoopStatus resets the offset.
-  bool is_loop_end_frame = false;
-  if (data->loop_count > 0) {
-    const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
-    is_loop_end_frame = (data->input_buffer_read_offset == loop_end);
-  }
-
-  UpdateLoopStatus(data);
 
   if (!data->output_buffer_block_count) {
     REXAPU_ERROR("XmaContext {}: Error - Received 0 for output_buffer_block_count!", id());
@@ -628,6 +912,21 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     }
   }
 
+  PendingFrameAdvance frame_advance = {};
+  frame_advance.valid = true;
+  if (!packet_info.isLastFrameInPacket()) {
+    const uint32_t next_frame_offset =
+        (data->input_buffer_read_offset + bits_to_copy) % kBitsPerPacket;
+    frame_advance.next_input_offset =
+        (packet_index * kBitsPerPacket) + next_frame_offset;
+  } else {
+    frame_advance.next_input_offset =
+        GetNextPacketReadOffset(current_input_buffer, next_packet_index,
+                                current_input_packet_count);
+    frame_advance.swap_input_buffer =
+        frame_advance.next_input_offset == kBitsPerPacketHeader;
+  }
+
   std::memcpy(input_buffer_.data(), packet + kBytesPerPacketHeader, kBytesPerPacketData);
 
   stream = BitStream(input_buffer_.data(), (kBitsPerPacket - kBitsPerPacketHeader) * 2);
@@ -643,55 +942,189 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   PrepareDecoder(data->sample_rate, bool(data->is_stereo));
   PreparePacket(packet_info.current_frame_size_, padding_start);
   if (DecodePacket(av_context_, av_packet_, av_frame_)) {
-    ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
-                 raw_frame_.data());
-    current_frame_remaining_subframes_ = 4 << data->is_stereo;
+    const int decoded_frame_samples = av_frame_->nb_samples;
+    const xma::LoopFrameSchedule schedule =
+        loop_scheduler_.ScheduleFrame(data->input_buffer_read_offset,
+                                      loop_config);
 
-    // Loop end: limit output to subframes 0..loop_subframe_end.
-    if (is_loop_end_frame) {
-      loop_frame_output_limit_ = (data->loop_subframe_end + 1) << data->is_stereo;
-    } else {
-      loop_frame_output_limit_ = 0;
+    uint32_t start_skip_samples = 0;
+    uint32_t end_skip_samples = 0;
+    if (const AVFrameSideData* skip_data =
+            av_frame_get_side_data(av_frame_, AV_FRAME_DATA_SKIP_SAMPLES);
+        skip_data && skip_data->size >= 8) {
+      const auto read_le_u32 = [](const uint8_t* bytes) {
+        return static_cast<uint32_t>(bytes[0]) |
+               (static_cast<uint32_t>(bytes[1]) << 8) |
+               (static_cast<uint32_t>(bytes[2]) << 16) |
+               (static_cast<uint32_t>(bytes[3]) << 24);
+      };
+      start_skip_samples = read_le_u32(skip_data->data);
+      end_skip_samples = read_le_u32(skip_data->data + 4);
     }
 
-    // Loop start: skip leading subframes per loop_subframe_skip.
-    if (loop_start_skip_pending_) {
-      const uint8_t skip = data->loop_subframe_skip << data->is_stereo;
-      if (skip < current_frame_remaining_subframes_) {
-        current_frame_remaining_subframes_ -= skip;
+    ConvertSamples(
+        reinterpret_cast<const uint8_t**>(&av_frame_->data),
+        bool(data->is_stereo), decoded_frame_samples, raw_frame_.data());
+
+    const uint8_t next_buffer_index = data->current_buffer ^ 1;
+    const bool available_input_ends =
+        frame_advance.swap_input_buffer &&
+        !data->IsInputBufferValid(next_buffer_index);
+    // An empty second input buffer can also mean temporary starvation for a
+    // streamed source. Treat it as physical EOF only when frame metadata or
+    // same-frame loop policy proves that the decoder tail is required.
+    const bool physical_eof =
+        available_input_ends &&
+        (end_skip_samples != 0 || is_same_frame_loop ||
+         start_skip_samples >=
+             static_cast<uint32_t>(decoded_frame_samples));
+    bool final_overlap_decoded = false;
+    uint32_t final_overlap_samples = 0;
+    if (physical_eof && DecodeFinalOverlap(av_context_, av_frame_)) {
+      final_overlap_decoded = true;
+      final_overlap_samples =
+          static_cast<uint32_t>(av_frame_->nb_samples);
+      ConvertSamples(
+          reinterpret_cast<const uint8_t**>(&av_frame_->data),
+          bool(data->is_stereo), final_overlap_samples,
+          raw_frame_.data() +
+              (static_cast<size_t>(decoded_frame_samples) *
+               kBytesPerSample << data->is_stereo));
+    }
+
+    xma::DecodedSampleWindow requested_window = {
+        .begin_sample =
+            static_cast<uint32_t>(schedule.window.begin_subframe) *
+            kSamplesPerSubframe,
+        .end_sample =
+            static_cast<uint32_t>(schedule.window.end_subframe) *
+            kSamplesPerSubframe,
+    };
+    if (final_overlap_decoded) {
+      if (is_same_frame_loop) {
+        // Encoded loop subframes precede their decoded IMDCT overlap by one
+        // overlap window. Shift both boundaries into the drained PCM.
+        requested_window.begin_sample += final_overlap_samples;
+        requested_window.end_sample += final_overlap_samples;
+      } else if (schedule.window.end_subframe ==
+                 xma::kSubframesPerFrame) {
+        // A non-looping full-frame request includes the final physical
+        // overlap before end padding is removed.
+        requested_window.end_sample += final_overlap_samples;
       }
-      loop_start_skip_pending_ = false;
     }
-  }
+    xma::DecodedStreamState loop_cache_stream_state =
+        decoded_stream_state_;
+    const xma::DecodedSampleSelection selected_samples =
+        decoded_stream_state_.SelectFrameWindows(
+            requested_window,
+            static_cast<uint32_t>(decoded_frame_samples),
+            final_overlap_samples, start_skip_samples, end_skip_samples,
+            physical_eof);
+    const uint32_t bytes_per_sample_frame =
+        kBytesPerSample << data->is_stereo;
+    logical_frame_.fill(0);
+    size_t logical_byte_count = 0;
+    for (uint8_t window_index = 0;
+         window_index < selected_samples.window_count; ++window_index) {
+      const xma::DecodedSampleWindow& window =
+          selected_samples.windows[window_index];
+      const size_t source_byte =
+          static_cast<size_t>(window.begin_sample) *
+          bytes_per_sample_frame;
+      const size_t window_byte_count =
+          static_cast<size_t>(window.sample_count()) *
+          bytes_per_sample_frame;
+      std::memcpy(logical_frame_.data() + logical_byte_count,
+                  raw_frame_.data() + source_byte, window_byte_count);
+      logical_byte_count += window_byte_count;
+    }
 
-  // Compute where to go next.
-  if (!packet_info.isLastFrameInPacket()) {
-    const uint32_t next_frame_offset =
-        (data->input_buffer_read_offset + bits_to_copy) % kBitsPerPacket;
-    data->input_buffer_read_offset = (packet_index * kBitsPerPacket) + next_frame_offset;
-    return;
-  }
+    if (is_same_frame_loop && final_overlap_decoded) {
+      const uint8_t repeated_begin_subframe =
+          std::min(loop_config.loop_subframe_skip,
+                   xma::kSubframesPerFrame);
+      const uint8_t repeated_end_subframe =
+          std::max<uint8_t>(
+              repeated_begin_subframe,
+              loop_config.loop_subframe_end == 0
+                  ? xma::kSubframesPerFrame
+                  : std::min(loop_config.loop_subframe_end,
+                             xma::kSubframesPerFrame));
+      const xma::DecodedSampleWindow repeated_requested_window = {
+          .begin_sample =
+              static_cast<uint32_t>(repeated_begin_subframe) *
+                  kSamplesPerSubframe +
+              final_overlap_samples,
+          .end_sample =
+              static_cast<uint32_t>(repeated_end_subframe) *
+                  kSamplesPerSubframe +
+              final_overlap_samples,
+      };
+      const xma::DecodedSampleSelection repeated_selection =
+          loop_cache_stream_state.SelectFrameWindows(
+              repeated_requested_window,
+              static_cast<uint32_t>(decoded_frame_samples),
+              final_overlap_samples, start_skip_samples,
+              end_skip_samples, physical_eof);
+      std::array<uint8_t,
+                 kBytesPerFrameWithFinalOverlapChannel * 2>
+          repeated_pcm = {};
+      size_t repeated_byte_count = 0;
+      for (uint8_t window_index = 0;
+           window_index < repeated_selection.window_count;
+           ++window_index) {
+        const xma::DecodedSampleWindow& window =
+            repeated_selection.windows[window_index];
+        const size_t source_byte =
+            static_cast<size_t>(window.begin_sample) *
+            bytes_per_sample_frame;
+        const size_t window_byte_count =
+            static_cast<size_t>(window.sample_count()) *
+            bytes_per_sample_frame;
+        std::memcpy(repeated_pcm.data() + repeated_byte_count,
+                    raw_frame_.data() + source_byte,
+                    window_byte_count);
+        repeated_byte_count += window_byte_count;
+      }
 
-  uint32_t next_input_offset =
-      GetNextPacketReadOffset(current_input_buffer, next_packet_index, current_input_packet_count);
-
-  if (next_input_offset == kBitsPerPacketHeader) {
-    SwapInputBuffer(data);
-    if (data->IsAnyInputBufferValid()) {
-      next_input_offset = xma::GetPacketFrameOffset(
-          memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
-
-      if (next_input_offset > kMaxFrameSizeinBits) {
-        SwapInputBuffer(data);
-        return;
+      const xma::LogicalLoopCacheKey cache_key = {
+          .input_buffer_address = current_input_buffer_address,
+          .frame_offset = data->input_buffer_read_offset,
+          .begin_subframe = repeated_begin_subframe,
+          .end_subframe = repeated_end_subframe,
+          .sample_rate = static_cast<uint8_t>(data->sample_rate),
+          .is_stereo = bool(data->is_stereo),
+      };
+      logical_loop_cache_frame_advance_ = {};
+      if (logical_loop_cache_.Store(
+              cache_key, repeated_pcm.data(), repeated_byte_count)) {
+        logical_loop_cache_frame_advance_ = frame_advance;
       }
     }
+
+    if (data->loop_count != 0 &&
+        data->input_buffer_read_offset == loop_config.loop_start_frame) {
+      loop_input_buffer_address_ = current_input_buffer_address;
+    }
+    current_frame_window_ = schedule.window;
+    current_frame_output_byte_ = 0;
+    current_frame_output_end_byte_ =
+        static_cast<uint32_t>(logical_byte_count);
+    current_frame_window_pending_ = true;
+    current_frame_physical_eof_ = physical_eof;
+    pending_frame_advance_ = frame_advance;
+  } else {
+    // FFmpeg may consume a physical frame without returning PCM while priming
+    // decoder state. Advance normally, but do not create a logical PCM window.
+    pending_frame_advance_ = frame_advance;
+    AdvanceInputAfterFrame(data);
   }
-  data->input_buffer_read_offset = next_input_offset;
 }
 
-void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
-                              uint8_t* output_buffer) {
+void XmaContext::ConvertSamples(const uint8_t** samples, bool is_two_channel,
+                                uint32_t sample_count,
+                                uint8_t* output_buffer) {
   // Loop through every sample, convert and drop it into the output array.
   // If more than one channel, we need to interleave the samples from each
   // channel next to each other. Always saturate because FFmpeg output is
@@ -703,13 +1136,13 @@ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
   // since the first menu frame; the intro cutscene also has more than 2
   // channels.
 #if REX_ARCH_AMD64
-  static_assert(kSamplesPerFrame % 8 == 0);
+  assert_zero(sample_count % 8);
   const auto in_channel_0 = reinterpret_cast<const float*>(samples[0]);
   const __m128 scale_mm = _mm_set1_ps(scale);
   if (is_two_channel) {
     const auto in_channel_1 = reinterpret_cast<const float*>(samples[1]);
     const __m128i shufmask = _mm_set_epi8(14, 15, 6, 7, 12, 13, 4, 5, 10, 11, 2, 3, 8, 9, 0, 1);
-    for (uint32_t i = 0; i < kSamplesPerFrame; i += 4) {
+    for (uint32_t i = 0; i < sample_count; i += 4) {
       // Load 8 samples, 4 for each channel.
       __m128 in_mm0 = _mm_loadu_ps(&in_channel_0[i]);
       __m128 in_mm1 = _mm_loadu_ps(&in_channel_1[i]);
@@ -728,7 +1161,7 @@ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
     }
   } else {
     const __m128i shufmask = _mm_set_epi8(14, 15, 12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1);
-    for (uint32_t i = 0; i < kSamplesPerFrame; i += 8) {
+    for (uint32_t i = 0; i < sample_count; i += 8) {
       // Load 8 samples, as [in_channel_0 + i * 4] and
       // [in_channel_0 + i * 4 + 16] movups.
       __m128 in_mm0 = _mm_loadu_ps(&in_channel_0[i]);
@@ -749,7 +1182,7 @@ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
   }
 #else
   uint32_t o = 0;
-  for (uint32_t i = 0; i < kSamplesPerFrame; i++) {
+  for (uint32_t i = 0; i < sample_count; i++) {
     for (uint32_t j = 0; j <= uint32_t(is_two_channel); j++) {
       // Select the appropriate array based on the current channel.
       auto in = reinterpret_cast<const float*>(samples[j]);

@@ -382,7 +382,7 @@ endif()
 
 set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
 
-# Overlay generated FFmpeg list files
+# Overlay generated FFmpeg list files and repo-specific source patches.
 set(FFMPEG_OVERLAY_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-overlay")
 set(FFMPEG_OVERLAY_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-overlay")
 file(MAKE_DIRECTORY "${FFMPEG_OVERLAY_BUILD_DIR}/libavcodec")
@@ -398,6 +398,63 @@ configure_file(
   "${FFMPEG_OVERLAY_SRC_DIR}/bsf_list.c" "${FFMPEG_OVERLAY_BUILD_DIR}/libavcodec/bsf_list.c"
   COPYONLY
 )
+
+# Keep experimental XMA decoder changes in this repository without modifying
+# the FFmpeg submodule. Patch a pristine copy in the build tree and compile it
+# in place of FFmpeg's original wmaprodec.c.
+set(FFMPEG_WMAPRO_SOURCE "${FFMPEG_OVERLAY_BUILD_DIR}/libavcodec/wmaprodec.c")
+set(FFMPEG_WMAPRO_PATCH "${FFMPEG_OVERLAY_SRC_DIR}/wmaprodec-xma-loop.patch")
+configure_file(
+  "${FFMPEG_DIR}/libavcodec/wmaprodec.c" "${FFMPEG_WMAPRO_SOURCE}"
+  COPYONLY
+)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FFMPEG_WMAPRO_PATCH}")
+find_program(GIT_EXECUTABLE git REQUIRED)
+execute_process(
+  COMMAND "${GIT_EXECUTABLE}" rev-parse --show-toplevel
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  RESULT_VARIABLE FFMPEG_GIT_ROOT_RESULT
+  OUTPUT_VARIABLE FFMPEG_GIT_ROOT
+  ERROR_VARIABLE FFMPEG_GIT_ROOT_ERROR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT FFMPEG_GIT_ROOT_RESULT EQUAL 0)
+  message(FATAL_ERROR
+    "Failed to locate the Git worktree for the FFmpeg patch:\n"
+    "${FFMPEG_GIT_ROOT_ERROR}"
+  )
+endif()
+file(RELATIVE_PATH FFMPEG_WMAPRO_PATCH_DIRECTORY
+  "${FFMPEG_GIT_ROOT}" "${FFMPEG_OVERLAY_BUILD_DIR}"
+)
+execute_process(
+  COMMAND "${GIT_EXECUTABLE}" apply --no-index --whitespace=nowarn
+          "--directory=${FFMPEG_WMAPRO_PATCH_DIRECTORY}"
+          "${FFMPEG_WMAPRO_PATCH}"
+  WORKING_DIRECTORY "${FFMPEG_GIT_ROOT}"
+  RESULT_VARIABLE FFMPEG_WMAPRO_PATCH_RESULT
+  OUTPUT_VARIABLE FFMPEG_WMAPRO_PATCH_OUTPUT
+  ERROR_VARIABLE FFMPEG_WMAPRO_PATCH_ERROR
+)
+if(NOT FFMPEG_WMAPRO_PATCH_RESULT EQUAL 0)
+  message(FATAL_ERROR
+    "Failed to apply ${FFMPEG_WMAPRO_PATCH} to FFmpeg's wmaprodec.c:\n"
+    "${FFMPEG_WMAPRO_PATCH_OUTPUT}"
+    "${FFMPEG_WMAPRO_PATCH_ERROR}"
+  )
+endif()
+file(READ "${FFMPEG_WMAPRO_SOURCE}" FFMPEG_WMAPRO_PATCHED_CONTENT)
+string(FIND "${FFMPEG_WMAPRO_PATCHED_CONTENT}"
+  "AV_FRAME_DATA_SKIP_SAMPLES" FFMPEG_WMAPRO_PATCH_MARKER
+)
+if(FFMPEG_WMAPRO_PATCH_MARKER EQUAL -1)
+  message(FATAL_ERROR
+    "Git did not apply ${FFMPEG_WMAPRO_PATCH} to ${FFMPEG_WMAPRO_SOURCE}:\n"
+    "${FFMPEG_WMAPRO_PATCH_OUTPUT}"
+    "${FFMPEG_WMAPRO_PATCH_ERROR}"
+  )
+endif()
+unset(FFMPEG_WMAPRO_PATCHED_CONTENT)
 
 # Common defines for both libraries
 set(FFMPEG_COMMON_DEFINES
@@ -583,7 +640,7 @@ add_library(libavcodec STATIC
     ${FFMPEG_DIR}/libavcodec/mdct_fixed_32.c
     ${FFMPEG_DIR}/libavcodec/sinewin.c
     ${FFMPEG_DIR}/libavcodec/wma_freqs.c
-    ${FFMPEG_DIR}/libavcodec/wmaprodec.c
+    ${FFMPEG_WMAPRO_SOURCE}
     ${FFMPEG_DIR}/libavcodec/wmadec.c
     ${FFMPEG_DIR}/libavcodec/wma.c
     ${FFMPEG_DIR}/libavcodec/wma_common.c
@@ -658,7 +715,9 @@ target_include_directories(libavcodec
     PUBLIC
         $<BUILD_INTERFACE:${FFMPEG_DIR}>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-    PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
+    PRIVATE
+        ${FFMPEG_DIR}/libavcodec
+        ${FFMPEG_ATOMICS_INCLUDE}
 )
 target_compile_definitions(libavcodec PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavcodec PRIVATE -w)  # Suppress warnings in third-party code

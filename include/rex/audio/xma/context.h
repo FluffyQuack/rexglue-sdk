@@ -15,6 +15,9 @@
 #include <atomic>
 #include <mutex>
 
+#include <rex/audio/xma/logical_loop_cache.h>
+#include <rex/audio/xma/loop_scheduler.h>
+#include <rex/audio/xma/sample_accounting.h>
 #include <rex/kernel.h>
 #include <rex/memory.h>
 #include <rex/thread.h>
@@ -180,7 +183,11 @@ class XmaContext {
   static const uint32_t kBytesPerSample = 2;
   static const uint32_t kSamplesPerFrame = 512;
   static const uint32_t kSamplesPerSubframe = 128;
+  static const uint32_t kSamplesPerFrameWithFinalOverlap =
+      kSamplesPerFrame + kSamplesPerSubframe;
   static const uint32_t kBytesPerFrameChannel = kSamplesPerFrame * kBytesPerSample;
+  static const uint32_t kBytesPerFrameWithFinalOverlapChannel =
+      kSamplesPerFrameWithFinalOverlap * kBytesPerSample;
   static const uint32_t kBytesPerSubframeChannel = kSamplesPerSubframe * kBytesPerSample;
 
   static const uint32_t kOutputBytesPerBlock = 256;
@@ -201,7 +208,7 @@ class XmaContext {
 
   memory::Memory* memory() const { return memory_; }
 
-  uint32_t id() { return id_; }
+  uint32_t id() const { return id_; }
   uint32_t guest_ptr() { return guest_ptr_; }
   bool is_allocated() { return is_allocated_.load(std::memory_order_acquire); }
   bool is_enabled() { return is_enabled_.load(std::memory_order_acquire); }
@@ -237,19 +244,25 @@ class XmaContext {
   uint8_t* GetCurrentInputBuffer(XMA_CONTEXT_DATA* data);
 
   void Decode(XMA_CONTEXT_DATA* data);
-  void Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data);
-  void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
+  bool Consume(memory::RingBuffer* output_rb, XMA_CONTEXT_DATA* data);
+  void WriteOutputPcm(memory::RingBuffer* output_rb, const uint8_t* pcm,
+                      size_t byte_count);
+  void AdvanceInputAfterFrame(XMA_CONTEXT_DATA* data);
+  void CompleteFrameWindow(XMA_CONTEXT_DATA* data);
   void ClearLocked(XMA_CONTEXT_DATA* data);
+  void ResetStreamState();
 
   memory::RingBuffer PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data);
   int PrepareDecoder(int sample_rate, bool is_two_channel);
   void PreparePacket(uint32_t frame_size, uint32_t frame_padding);
   bool DecodePacket(AVCodecContext* av_context, const AVPacket* av_packet, AVFrame* av_frame);
+  bool DecodeFinalOverlap(AVCodecContext* av_context, AVFrame* av_frame);
 
   void StoreContextMerged(const XMA_CONTEXT_DATA& data, const XMA_CONTEXT_DATA& initial_data,
                           uint8_t* context_ptr);
 
-  static void ConvertFrame(const uint8_t** samples, bool is_two_channel, uint8_t* output_buffer);
+  static void ConvertSamples(const uint8_t** samples, bool is_two_channel,
+                             uint32_t sample_count, uint8_t* output_buffer);
 
   memory::Memory* memory_ = nullptr;
   std::unique_ptr<rex::thread::Event> work_completion_event_;
@@ -271,15 +284,35 @@ class XmaContext {
   // First byte contains bit offset information
   std::array<uint8_t, 1 + 4096> xma_frame_;
   // Conversion buffer for up to 2-channel frame
-  std::array<uint8_t, kBytesPerFrameChannel * 2> raw_frame_;
+  std::array<uint8_t, kBytesPerFrameWithFinalOverlapChannel * 2> raw_frame_;
+  // Selected logical samples packed contiguously after skip/padding removal.
+  std::array<uint8_t, kBytesPerFrameWithFinalOverlapChannel * 2>
+      logical_frame_;
+  bool decoder_needs_flush_ = false;
 
   // Output buffer tracking
   int32_t remaining_subframe_blocks_in_output_buffer_ = 0;
-  uint8_t current_frame_remaining_subframes_ = 0;
+  xma::DecodedFrameWindow current_frame_window_;
+  uint32_t current_frame_output_byte_ = 0;
+  uint32_t current_frame_output_end_byte_ = 0;
+  bool current_frame_window_pending_ = false;
+  bool current_frame_physical_eof_ = false;
+  std::array<uint8_t, kOutputBytesPerBlock> partial_output_block_ = {};
+  uint32_t partial_output_block_bytes_ = 0;
 
-  // Loop subframe precision state
-  uint8_t loop_frame_output_limit_ = 0;
-  bool loop_start_skip_pending_ = false;
+  struct PendingFrameAdvance {
+    uint32_t next_input_offset = kBitsPerPacketHeader;
+    bool swap_input_buffer = false;
+    bool valid = false;
+  };
+  PendingFrameAdvance pending_frame_advance_;
+  xma::LogicalLoopCache<kBytesPerFrameWithFinalOverlapChannel * 2>
+      logical_loop_cache_;
+  PendingFrameAdvance logical_loop_cache_frame_advance_;
+  xma::DecodedStreamState decoded_stream_state_;
+  xma::LoopFrameScheduler loop_scheduler_;
+  uint32_t loop_input_buffer_address_ = 0;
+  uint32_t loop_diagnostic_event_count_ = 0;
 };
 
 }  // namespace rex::audio
