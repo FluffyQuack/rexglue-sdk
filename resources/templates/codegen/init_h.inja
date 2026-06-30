@@ -46,6 +46,14 @@
 #include <unordered_map>
 
 //=============================================================================
+// Guest Global/Data Symbols
+//=============================================================================
+
+{% if globals %}namespace {{ project }}::guest_globals {
+{% for global in globals %}inline constexpr auto {{ global.name }} = {{ global.address }};
+{% endfor %}}  // namespace {{ project }}::guest_globals
+
+{% endif %}//=============================================================================
 // Image Info
 //=============================================================================
 

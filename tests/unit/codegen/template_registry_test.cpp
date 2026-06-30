@@ -87,6 +87,7 @@ TEST_CASE("TemplateRegistry: render with codegen data", "[TemplateRegistry]") {
     "rexcrt_heap": 1,
     "config_flags": {},
     "functions": [],
+    "globals": [],
     "imports": []
   })";
 
@@ -103,6 +104,7 @@ TEST_CASE("TemplateRegistry: render unknown ID throws TemplateError", "[Template
 TEST_CASE("TemplateRegistry: init_h includes shared indirect-call partial", "[TemplateRegistry]") {
   rex::codegen::TemplateRegistry registry;
   std::string json = R"({
+    "project": "test_proj",
     "config_flags": {
       "skip_lr": false,
       "ctr_as_local": false,
@@ -120,9 +122,14 @@ TEST_CASE("TemplateRegistry: init_h includes shared indirect-call partial", "[Te
     "thunk_reserve_size": "0x1000",
     "rexcrt_heap": false,
     "functions": [],
+    "globals": [
+      {"name": "type_registry_entries", "address": "0x830F5198u"}
+    ],
     "imports": []
   })";
   std::string result = registry.render("codegen/init_h", json);
+  CHECK(result.find("namespace test_proj::guest_globals") != std::string::npos);
+  CHECK(result.find("type_registry_entries = 0x830F5198u") != std::string::npos);
   CHECK(result.find("REX_LOOKUP_FUNC") != std::string::npos);
   CHECK(result.find("ResolveIndirectFunction") != std::string::npos);
   CHECK(result.find("last_indirect_target") != std::string::npos);

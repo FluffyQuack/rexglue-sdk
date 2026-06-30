@@ -119,6 +119,44 @@ TEST_CASE("Config collection merge - additive", "[codegen][config]") {
   fs::remove_all(tmp);
 }
 
+TEST_CASE("Config globals merge and validate", "[codegen][config]") {
+  auto tmp = fs::temp_directory_path() / "rex_cfg_globals";
+  fs::remove_all(tmp);
+  fs::create_directories(tmp);
+
+  WriteTempToml(tmp, "base.toml",
+                "file_path = \"game.xex\"\n"
+                "\n"
+                "[globals]\n"
+                "0x830F5198 = { name = \"type_registry_entries\", size = 0x1C0 }\n");
+
+  WriteTempToml(tmp, "top.toml",
+                "includes = [\"base.toml\"]\n"
+                "file_path = \"game.xex\"\n"
+                "\n"
+                "[globals]\n"
+                "0x82B56F24 = \"type_registry_count\"\n");
+
+  rex::codegen::RecompilerConfig cfg;
+  REQUIRE(cfg.Load((tmp / "top.toml").string()));
+
+  REQUIRE(cfg.globals.count(0x830F5198u) == 1);
+  REQUIRE(cfg.globals.count(0x82B56F24u) == 1);
+  CHECK(cfg.globals.at(0x830F5198u).name == "type_registry_entries");
+  CHECK(cfg.globals.at(0x830F5198u).size == 0x1C0u);
+  CHECK(cfg.globals.at(0x82B56F24u).name == "type_registry_count");
+
+  rex::codegen::RecompilerConfig invalidCfg;
+  rex::codegen::GlobalConfig keywordGlobal;
+  keywordGlobal.name = "class";
+  invalidCfg.globals.emplace(0x830F5200u, keywordGlobal);
+  auto validation = invalidCfg.Validate();
+  CHECK_FALSE(validation.valid);
+  CHECK_FALSE(validation.errors.empty());
+
+  fs::remove_all(tmp);
+}
+
 // ---------------------------------------------------------------------------
 // Test 3: Keyed conflict -- last wins
 // ---------------------------------------------------------------------------
