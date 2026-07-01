@@ -934,6 +934,38 @@
 "0x822383f0" = { name = "ms_grid_clear_object_slots" }    # zero an object's cell-node slot count (obj+0x29 = 0); called by ms_obj_init
 
 # ---------------------------------------------------------------------------
+# Collision / active hitbox lists (RE'd 2026-06-30 while looking for enemy-list
+# data). This is not enemy-only: players, projectiles, effects, and enemies all
+# feed the same active hitbox machinery. The enemy-list-adjacent part is the pair
+# of 128-entry active object buffers at 0x82D7BDE0 / 0x82D7BA80, each with a
+# count at +0x350 and per-group/bucket bitsets before the object-pointer rows.
+# Per-object collision state lives in the base object around +0x8C/+0x90/+0x94/
+# +0x95/+0xAA/+0xAC/+0xAD/+0xB8.
+"0x82211340" = { name = "ms_obj_collision_state_reset" } # clear one object's collision damage/descriptor/list-slot state (+0x8C/+0x90/+0x94/+0x95/+0xAA/+0xAC/+0xAD/+0xB8).
+"0x82211378" = { name = "ms_collision_active_list_clear" } # clear one 0x350-byte active hitbox buffer: zero count at +0x350 and all bucket/group bitset words.
+"0x822113B0" = { name = "ms_collision_clip_hitbox_to_bucket_range" } # project an object's hitbox rect to screen/bucket coordinates, clip against the 320x240 playfield-expanded range, and return 1 when fully outside.
+"0x822114A8" = { name = "ms_collision_apply_global_hit25_gate" } # optional global hit gate: when enabled and the collision descriptor remaps id 25 to nonzero, mark obj hit code 25 and suppress active-list registration.
+"0x82211548" = { name = "ms_obj_collision_has_hit_code" } # return whether obj+0xAA has a nonzero pending/applied collision hit code.
+"0x82211558" = { name = "ms_collision_force_buffer_a_reset_flag" } # set the reset/debug flag byte for one active collision buffer (0x82D7BDDC) to 0xFF.
+"0x82211568" = { name = "ms_collision_force_buffer_b_reset_flag" } # set the reset/debug flag byte for the sibling active collision buffer (0x82D7C948) to 0xFF.
+"0x82211578" = { name = "ms_collision_buffer_b_reset_flag_is_set" } # boolean test of the latched active-buffer reset flag mirrored at 0x82D7C136.
+"0x82211590" = { name = "ms_obj_collision_set_flag80" } # set obj+0xAC bit7; many entity handlers use it to tag collision participation/state.
+"0x822115A0" = { name = "ms_collision_test_rect_against_player_hitbox" } # choose player 0/1 by r5, resolve that player's collision descriptor at obj+0x90, and test a caller rect against the player's hitbox.
+"0x82211720" = { name = "ms_collision_debug_draw_hitbox_rect" } # draw one object-relative hitbox rect after flip and camera adjustment; used by the collision table tick and debug paths.
+"0x82211818" = { name = "ms_collision_set_object_slot_record" } # add/update/remove an object in the 256-entry {obj, hitbox-record} table at 0x82D7C140; stores the slot index in obj+0xB8 low bits.
+"0x822118B8" = { name = "ms_obj_collision_side_flag_is_active" } # inspect obj+0xB8 side/edge flags and pose direction to return whether the relevant collision-side flag is active.
+"0x82211900" = { name = "ms_collision_scan_slot_table_for_edges" } # scan the 256-slot hitbox table against the current camera/playfield bounds, set obj+0xB8 edge bits, and return side flags for the caller.
+"0x82211C40" = { name = "ms_obj_collision_clear_edge_flags" } # clear the collision edge bits in obj+0xB8 while preserving the low slot index.
+"0x82211C50" = { name = "ms_obj_collision_ack_edge_flags" } # consume/clear collision edge bits in obj+0xB8 and update the global edge accumulator at 0x82D7CAC8.
+"0x82211CB8" = { name = "ms_collision_accumulate_object_bucket_weights" } # add weighted coverage for an object's screen-space position into the 16x16-ish collision occupancy buckets at 0x82D7C960.
+"0x822121C0" = { name = "ms_collision_resolve_hit_pair" } # apply one source/target hit result: update target damage/code/state fields, track min/max hit depths, trigger player/effect side effects, and call the hit callback path.
+"0x82212420" = { name = "ms_collision_debug_draw_object_hitboxes" } # draw every 0x8000-terminated hitbox rect in an object's collision descriptor when the debug flag at 0x82D7CA68 is enabled.
+"0x822124B8" = { name = "ms_collision_register_active_object" } # register one object's collision descriptor into the active buffer: clip hitboxes, set group/bucket bitsets, append object pointer, and save list slot in obj+0x94/+0x95.
+"0x822127C8" = { name = "ms_collision_process_candidate_hit" } # after a candidate object is selected, apply descriptor damage/remap rules, compute contact direction/angle metadata, debug-draw hitboxes, and resolve the pair.
+"0x82212B88" = { name = "ms_collision_test_candidate_object" } # test one active-list candidate object's hitboxes against the caller hitbox descriptor and dispatch to ms_collision_process_candidate_hit on overlap.
+"0x82212E40" = { name = "ms_collision_query_active_hitboxes" } # build candidate bitsets from the active buffer's group and bucket masks, iterate up to 64 stored object pointers, then debug-draw the caller hitboxes.
+
+# ---------------------------------------------------------------------------
 # GAMEPLAY LOGIC TICK — the sim-step seam (RE'd 2026-06-24, on the 60fps path).
 #
 # This is the per-step gameplay update: the function the sim advances each logic
@@ -951,8 +983,9 @@
 # (each *_init below pairs 1:1 with a *_tick) and seeds the playfield
 # CENTER 160,120 (= 320/2, 240/2) into the stage controller at 0x82D39B74
 # (+0x08 = 160, +0x10 = 120) plus both player records via ms_player_record_init.
-# The init/tick pairing is proven field-level for the slot table: ms_gameplay_init
-# clears the 256-entry table at 0x82D7C140 (ms_tick_object_slot_table walks it).
+# The init/tick pairing is proven field-level for the collision tables:
+# ms_gameplay_init clears the 256-entry table at 0x82D7C140 that
+# ms_collision_tick_tables walks.
 #
 # => For interpolation: snapshot every live object's pose {+0x18,+0x1c} on entry
 # to ms_gameplay_tick (prev) and on exit (current); ms_render_list_add_sprite then
@@ -972,7 +1005,7 @@
 # interpolation state, not blend across the reset.
 "0x8228b9d8" = { name = "ms_init_player_objects_for_gameplay" }   # reset both player root objects (0x82BD3E58/0x82BD3F20) via ms_player_root_reset, then clear their tracked-object links via 0x82236D40
 "0x82205338" = { name = "ms_sound_reset_event_slots" }            # clear the 15 sound-event slots at 0x82DDCC60 (slot bytes +0x0c/+0x0d, timer +0x0e, id=-1), then reset the packed sound-event dispatcher through 0x821F4688(0)
-"0x82211e38" = { name = "ms_init_object_slot_table" }             # clear the 256-entry object slot table at 0x82D7C140 plus its side tables/flags; ms_tick_object_slot_table walks this each gameplay tick
+"0x82211e38" = { name = "ms_collision_init_tables" }              # clear the 256-entry collision slot table at 0x82D7C140 plus the active buffers, bucket bitsets, reset flags, and side tables used by ms_collision_tick_tables.
 "0x82233e98" = { name = "ms_init_obj_screenpos_buffers" }         # reset the two small screen-position buffers at 0x82D8B4C0/0x82D8B140 (six 0x90-byte-spaced entries each) before ms_tick_compute_obj_screenpos starts filling them
 "0x8229a3f0" = { name = "ms_init_loop_sound_99" }                 # reset continuous sound-event 99 state (0x82D39CF0 block + edge byte 0x82D73F2F) before ms_tick_loop_sound_99 edge-drives ARC_SE arcse041
 "0x8229f378" = { name = "ms_init_loop_sound_114" }                # reset continuous sound-event 114 state (0x82D39D30 block + edge byte 0x82D73F2E) before ms_tick_loop_sound_114 edge-drives event 114
@@ -994,7 +1027,7 @@
 # (Each *_tick has an *_init counterpart invoked by ms_gameplay_init.)
 "0x82247c88" = { name = "ms_tick_camera_region" }          # camera/scroll region state machine (states 0/1/2): gated on the ptr at 0x82D74668, compares the scroll position against the 0x82D7466C/0x82D746A0 limits (camera-globals range that ms_camera_reset zeroes). [role: camera/scroll, mechanism confirmed]
 "0x822a5940" = { name = "ms_tick_player_object_callbacks" } # walk the callback list at 0x82D39D54, sentinel-test player obj 0x82BD3E58, and bctrl each entry using the player position (g_player_pos_record 0x82D73F20). [player vs object pass; purpose tentative — collision/interaction]
-"0x82211ee8" = { name = "ms_tick_object_slot_table" }      # walk the 256-entry, 8-byte slot table at 0x82D7C140; for live {ptr,ptr} slots validate obj+0xB8 (low 13 bits == slot index) and call 0x82211720. Cleared by its init 0x82211e38.
+"0x82211ee8" = { name = "ms_collision_tick_tables" }      # tick/debug the collision tables: walk the 256-entry {obj,hitbox-record} table at 0x82D7C140, decay bucket rows, flip/clear active buffers, and update collision debug/edge flags.
 "0x82233ef8" = { name = "ms_tick_compute_obj_screenpos" }  # fetch a target object (0x8221FA88) and compute its screen X/Y from the pose at obj+0x88 (with hflip handling); writes 0x8000 to 0x82D7B4B0. [mechanism = world->screen of one object; purpose tentative]
 "0x82219e40" = { name = "ms_tick_oddframe_gate" }          # read the sw vblank counter parity (0x82D74A76 bit0) and clear a u16 at 0x82D7B9A0+0x60 / 0x82D7B920+0x60 accordingly (alternating-frame gate). [leaf]
 "0x82235098" = { name = "ms_tick_effect_table" }           # reset two 24-word arrays in the 0x82CF66F8 block then update up to 32 slots, decrementing each slot timer and calling 0x8223E600 on the live ones. [32-slot timed effect/particle table]
@@ -1642,15 +1675,15 @@ SwitchToFiber        = 0x8242D230
 0x82294DE0 = { size = 0x50 }
 0x82294E38 = { size = 0x58 }
 0x82294E90 = { size = 0x44 }
-0x82295348 = { size = 0x8C }
-0x82295658 = { size = 0x74 }
-0x822957E8 = { size = 0x64 }
-0x822958C8 = { size = 0xA4 }
-0x82295A60 = { size = 0xB8 }
-0x82295BC0 = { size = 0x8C }
-0x82295CB0 = { size = 0x8C }
-0x82295D40 = { size = 0x74 }
-0x82296368 = { size = 0xA0 }
+0x82295348 = { size = 0x8C, name = "ms_mission2_boss_body_spawn" }                  # handler table 0x821BDE98; type 48, script 867, anim 22, then body tick 0x822947F0/0x82294688
+0x82295658 = { size = 0x74, name = "ms_mission2_boss_type142_part_spawn" }          # handler table 0x821BDEB8; type 142, anim 23, script 15, chains into the shared part tick at 0x82294BF8
+0x822957E8 = { size = 0x64, name = "ms_mission2_boss_anim_c2_spawn" }               # type 49 child anim setup: anim 194, script 892, then 0x82294CD8
+0x822958C8 = { size = 0xA4, name = "ms_mission2_boss_anim_c1_side_spawn" }          # type 49 child anim setup: side/random offset, anim 193, script 15, inherits parent Y before shared expiry check
+0x82295A60 = { size = 0xB8, name = "ms_mission2_boss_anim_c3_child_spawn" }         # type 49 child anim setup: anim 195, script 45, bumps parent child counter until expiry
+0x82295BC0 = { size = 0x8C, name = "ms_mission2_boss_anim_5d_spawn" }               # type 49 child anim setup: anim 93, script 516, then shared body/expiry check
+0x82295CB0 = { size = 0x8C, name = "ms_mission2_boss_type142_falling_part_spawn" }  # type 142 part setup: anim 24, script 15, seeds velocity before 0x82294ED8
+0x82295D40 = { size = 0x74, name = "ms_mission2_boss_anim_c4_spawn" }               # type 49 child anim setup: anim 196, script 15, then 0x82294F50
+0x82296368 = { size = 0xA0, name = "ms_mission2_boss_variant_projectile_spawn" }    # type 127 setup; state+5 indexes anim/collision tables before 0x82295970
 0x82296490 = { size = 0x3C }
 0x822964D0 = { size = 0x4 }
 0x822964D8 = { size = 0x4 }
@@ -1659,17 +1692,17 @@ SwitchToFiber        = 0x8242D230
 0x82296590 = { size = 0x3C }
 0x822965D0 = { size = 0x58 }
 0x82296760 = { size = 0x3C }
-0x82296890 = { size = 0xC8 }
+0x82296890 = { size = 0xC8, name = "ms_mission2_boss_flash_effect_spawn" }          # type 15 effect setup: anim 88, scripts 14/15, enqueues sound event 96, then 0x82296180
 0x822969B0 = { size = 0x1C }
-0x82296F78 = { size = 0x80 }
+0x82296F78 = { size = 0x80, name = "ms_mission2_boss_part_force_mode2" }            # type 49 continuation; sets state+0x26=2 before falling into the 0x82295DB8 tick path
 0x82296FF8 = { size = 0x50 }
-0x82297048 = { size = 0x60 }
-0x82297638 = { size = 0xB8 }
-0x82297760 = { size = 0x6C }
-0x82297F58 = { size = 0x9C }
+0x82297048 = { size = 0x60, name = "ms_mission2_boss_part_disable_variant" }        # forces state+5/state+0x27 to 0xFF and redirects to the 0x82295E58 continuation
+0x82297638 = { size = 0xB8, name = "ms_mission2_boss_attack_windup" }               # attack setup unless obj+0xAA == 24: anim 2, state+0x26=1/state+0x27=4, sound event 48
+0x82297760 = { size = 0x6C, name = "ms_mission2_boss_attack_loop_start" }           # attack follow-up: anim 20, state+0x27=3, clears the local timer, then 0x822974C8
+0x82297F58 = { size = 0x9C, name = "ms_mission2_boss_break_transition" }            # enqueues sound event 110, resets boss state, then routes to 0x82297D78 or the anim-2 continuation
 0x82298E18 = { size = 0x24 }
 0x82298E80 = { size = 0x64 }
-0x82298F48 = { size = 0xC4 }
+0x82298F48 = { size = 0xC4, name = "ms_mission2_boss_explosion_marker_spawn" }      # type 48 effect setup: script 888, anim 2, sound event 93, removes itself on collision/end checks
 0x822991A0 = { size = 0xB0 }
 0x82299250 = { size = 0x248 }
 0x82299498 = { size = 0xB8 }

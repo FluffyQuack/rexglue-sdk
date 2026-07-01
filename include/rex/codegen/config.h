@@ -60,6 +60,12 @@ struct FunctionConfig {
   bool isChunk() const { return parent != 0; }
 };
 
+struct GlobalConfig {
+  std::string name;     // C++ identifier emitted as a guest-address alias
+  uint32_t size = 0;    // Optional byte size hint for documentation/tooling
+  std::string comment;  // TOML comment text harvested from the config.
+};
+
 // Section info for analysis output
 struct SectionInfo {
   std::string name;
@@ -108,6 +114,7 @@ struct RecompilerConfig {
 
   // === Manual overrides ===
   std::unordered_map<uint32_t, FunctionConfig> functions;  ///< Function/chunk configuration
+  std::unordered_map<uint32_t, GlobalConfig> globals;       ///< Guest global/data symbol names
   std::unordered_map<uint32_t, JumpTable> switchTables;
   std::unordered_map<uint32_t, MidAsmHook> midAsmHooks;
   uint32_t longJmpAddress = 0;

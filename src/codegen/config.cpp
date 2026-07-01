@@ -13,11 +13,13 @@
 // TOML config file loading
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <map>
 #include <optional>
 #include <set>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <fmt/format.h>
@@ -149,6 +151,47 @@ std::string HarvestComment(const std::vector<std::string>& lines, size_t entryLi
     result += *inlineText;
   }
   return result;
+}
+
+bool IsValidIdentifier(std::string_view name) {
+  if (name.empty())
+    return false;
+
+  static constexpr std::string_view kCppKeywords[] = {
+      "alignas",        "alignof",      "and",           "and_eq",       "asm",
+      "auto",           "bitand",       "bitor",         "bool",         "break",
+      "case",           "catch",        "char",          "char8_t",      "char16_t",
+      "char32_t",       "class",        "compl",         "concept",      "const",
+      "consteval",      "constexpr",    "constinit",     "const_cast",   "continue",
+      "co_await",       "co_return",    "co_yield",      "decltype",     "default",
+      "delete",         "do",           "double",        "dynamic_cast", "else",
+      "enum",           "explicit",     "export",        "extern",       "false",
+      "float",          "for",          "friend",        "goto",         "if",
+      "inline",         "int",          "long",          "mutable",      "namespace",
+      "new",            "noexcept",     "not",           "not_eq",       "nullptr",
+      "operator",       "or",           "or_eq",         "private",      "protected",
+      "public",         "register",     "reinterpret_cast", "requires",  "return",
+      "short",          "signed",       "sizeof",        "static",       "static_assert",
+      "static_cast",    "struct",       "switch",        "template",     "this",
+      "thread_local",   "throw",        "true",          "try",          "typedef",
+      "typeid",         "typename",     "union",         "unsigned",     "using",
+      "virtual",        "void",         "volatile",      "wchar_t",      "while",
+      "xor",            "xor_eq",
+  };
+
+  auto isIdentHead = [](unsigned char c) { return std::isalpha(c) || c == '_'; };
+  auto isIdentTail = [](unsigned char c) { return std::isalnum(c) || c == '_'; };
+
+  if (!isIdentHead(static_cast<unsigned char>(name.front())))
+    return false;
+  if (!std::all_of(name.begin() + 1, name.end(), [&](char c) {
+        return isIdentTail(static_cast<unsigned char>(c));
+      })) {
+    return false;
+  }
+
+  return std::find(std::begin(kCppKeywords), std::end(kCppKeywords), name) ==
+         std::end(kCppKeywords);
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +376,50 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
     }
     if (added > 0) {
       REXCODEGEN_DEBUG("[config]   [functions] added/updated {} entries from {}", added, filePath);
+    }
+  }
+
+  // [globals]
+  if (auto globalsTable = toml["globals"].as_table()) {
+    size_t added = 0;
+    for (auto& [key, value] : *globalsTable) {
+      std::string keyStr(key.str());
+      auto addrOpt = ParseHexAddress(keyStr);
+      if (!addrOpt) {
+        REXCODEGEN_ERROR("Invalid global address key: {}", keyStr);
+        continue;
+      }
+      uint32_t address = *addrOpt;
+
+      GlobalConfig gcfg;
+      if (auto name = value.value<std::string>()) {
+        gcfg.name = *name;
+      } else if (auto* table = value.as_table()) {
+        gcfg.name = (*table)["name"].value_or(std::string{});
+        gcfg.size = (*table)["size"].value_or(0u);
+      } else {
+        REXCODEGEN_ERROR("Invalid [globals] entry at 0x{:08X}: expected string or table", address);
+        continue;
+      }
+
+      if (gcfg.name.empty()) {
+        REXCODEGEN_ERROR("Global 0x{:08X}: missing 'name'", address);
+        continue;
+      }
+
+      if (rawLines) {
+        gcfg.comment = HarvestComment(*rawLines, key.source().begin.line);
+      }
+
+      auto it = cfg.globals.find(address);
+      if (it != cfg.globals.end()) {
+        REXCODEGEN_DEBUG("[config]   [globals] 0x{:08X} overridden from {}", address, filePath);
+      }
+      cfg.globals.insert_or_assign(address, std::move(gcfg));
+      ++added;
+    }
+    if (added > 0) {
+      REXCODEGEN_DEBUG("[config]   [globals] added/updated {} entries from {}", added, filePath);
     }
   }
 
@@ -579,6 +666,9 @@ bool FinalizeConfig(RecompilerConfig& cfg) {
     REXCODEGEN_TRACE("Loaded {} function configs ({} standalone, {} chunks)", cfg.functions.size(),
                      cfg.functions.size() - chunks_count, chunks_count);
   }
+  if (!cfg.globals.empty()) {
+    REXCODEGEN_TRACE("Loaded {} guest global/data symbol configs", cfg.globals.size());
+  }
   if (!cfg.exceptionHandlerFuncHints.empty()) {
     std::sort(cfg.exceptionHandlerFuncHints.begin(), cfg.exceptionHandlerFuncHints.end());
     cfg.exceptionHandlerFuncHints.erase(
@@ -645,6 +735,24 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
       result.errors.push_back(
           fmt::format("rexcrt function '{}' address 0x{:08X} is not 4-byte aligned", name, addr));
       result.valid = false;
+    }
+  }
+
+  {
+    std::unordered_map<std::string, uint32_t> names;
+    for (const auto& [addr, cfg] : globals) {
+      if (!IsValidIdentifier(cfg.name)) {
+        result.errors.push_back(
+            fmt::format("Global 0x{:08X} name '{}' is not a valid C++ identifier", addr, cfg.name));
+        result.valid = false;
+      }
+
+      auto [it, inserted] = names.emplace(cfg.name, addr);
+      if (!inserted) {
+        result.errors.push_back(fmt::format(
+            "Duplicate global name '{}': 0x{:08X} and 0x{:08X}", cfg.name, it->second, addr));
+        result.valid = false;
+      }
     }
   }
 
